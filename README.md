@@ -48,7 +48,16 @@ boxme npm ci
 boxme --strict composer install   # deny-by-default network: registries only
 boxme --keep npm install          # keep the VM around afterwards
 boxme --memory 4096 --cpus 4 composer update
+
+# Pass environment variables into the guest (private registries, auth):
+boxme -e COMPOSER_AUTH composer install      # copy host value
+boxme -e NPM_TOKEN=xyz npm install           # set explicitly
 ```
+
+Anything you pass with `-e` is visible to the package code running in the
+sandbox — a malicious postinstall could read it and try to send it somewhere.
+The Network tab shows every destination contacted; `--strict` limits where
+anything can go.
 
 ### Review keys
 
