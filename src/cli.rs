@@ -12,6 +12,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub strict: bool,
 
+    /// Observe the command once, let you pick which contacted domains to trust,
+    /// save them to `.boxme/allow`, then re-run the command under deny-by-default
+    /// enforcement before the file review.
+    #[arg(long, global = true)]
+    pub learn: bool,
+
     /// Keep the VM running after the run instead of removing it.
     #[arg(long, global = true)]
     pub keep: bool,

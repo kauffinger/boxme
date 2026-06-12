@@ -11,28 +11,38 @@ pub struct Entry {
 
 pub type Manifest = BTreeMap<String, Entry>;
 
-/// Parse the output of `scripts::MANIFEST`: a `#FILES` section of
-/// `path\tsize\ttype` lines, then a `#MD5` section of `hash  /workspace/path`.
+/// Parse the output of `scripts::MANIFEST`: NUL-delimited records, a `#FILES`
+/// section of `size\ttype\tpath` then a `#MD5` section of `hash  /workspace/path`
+/// (from `md5sum -z`). The path is the record's last field, so tabs or newlines
+/// in a filename stay part of the path instead of forging extra records.
 pub fn parse(output: &str) -> Manifest {
     let mut manifest = Manifest::new();
     let mut in_md5 = false;
-    for line in output.lines() {
-        match line {
+    for record in output.split('\0') {
+        match record {
             "#FILES" => in_md5 = false,
             "#MD5" => in_md5 = true,
             "" => {}
             _ if in_md5 => {
-                let Some((hash, path)) = line.split_once("  ") else {
+                // `md5sum` output is a 32-char hex digest, two spaces, then the
+                // verbatim path — split on the fixed digest width rather than a
+                // delimiter the path itself could contain.
+                if record.len() < 34 {
                     continue;
-                };
+                }
+                let (hash, rest) = record.split_at(32);
+                if !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let path = rest.trim_start_matches(' ');
                 let path = path.strip_prefix("/workspace/").unwrap_or(path);
                 if let Some(entry) = manifest.get_mut(path) {
                     entry.md5 = Some(hash.to_string());
                 }
             }
             _ => {
-                let mut parts = line.split('\t');
-                let (Some(path), Some(size), Some(kind)) =
+                let mut parts = record.splitn(3, '\t');
+                let (Some(size), Some(kind), Some(path)) =
                     (parts.next(), parts.next(), parts.next())
                 else {
                     continue;
@@ -145,5 +155,36 @@ pub fn expected_write_set(tool: &str, args: &[String]) -> WriteSet {
             dirs: vec![],
             files: vec![],
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_files_and_joins_md5() {
+        let output = "#FILES\0\
+            12\tf\tcomposer.json\0\
+            4096\td\tsrc\0\
+            #MD5\0\
+            d41d8cd98f00b204e9800998ecf8427e  /workspace/composer.json\0";
+        let manifest = parse(output);
+        let json = manifest.get("composer.json").unwrap();
+        assert_eq!(json.kind, 'f');
+        assert_eq!(json.size, 12);
+        assert_eq!(json.md5.as_deref(), Some("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(manifest.get("src").unwrap().kind, 'd');
+    }
+
+    #[test]
+    fn filename_with_tab_and_newline_stays_one_entry() {
+        // A name containing a tab and a newline must not forge extra records or
+        // truncate the path — it is the record's last field, NUL-delimited.
+        let nasty = "weird\tname\nwith-breaks.txt";
+        let output = format!("#FILES\05\tf\t{nasty}\0");
+        let manifest = parse(&output);
+        assert_eq!(manifest.len(), 1);
+        assert!(manifest.contains_key(nasty));
     }
 }

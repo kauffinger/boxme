@@ -1,3 +1,4 @@
+mod allowlist;
 mod cli;
 mod copyback;
 mod detect;

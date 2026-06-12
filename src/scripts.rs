@@ -62,6 +62,13 @@ echo ">> base image ready"
 /// Extract the host tarball and tag a git baseline so changes can be diffed
 /// out later. Unlike microphp there is no reset-to-last-commit: the user's
 /// uncommitted state is exactly what the command should operate on.
+///
+/// `core.hooksPath=/dev/null` disables any hooks shipped in the project (incl.
+/// husky, which also drives them via core.hooksPath) so committing the baseline
+/// can't run project code; `--no-verify` is the belt-and-suspenders. `add -Af`
+/// forces .gitignore'd files (e.g. `.env`) into the baseline so that if package
+/// code later modifies one, `git diff` against the baseline still shows it — the
+/// baseline lives only in the guest and is never copied back.
 pub const UNPACK: &str = r#"
 set -e
 mkdir -p /workspace
@@ -69,9 +76,10 @@ tar --no-same-owner -xzf /tmp/repo.tgz -C /workspace
 rm -f /tmp/repo.tgz
 cd /workspace
 git config --global --add safe.directory /workspace
+git config --global core.hooksPath /dev/null
 if ! git rev-parse --git-dir >/dev/null 2>&1; then git init -q; fi
-git add -A
-git -c user.email=boxme@local -c user.name=boxme commit -qm "boxme baseline" || true
+git add -Af
+git -c user.email=boxme@local -c user.name=boxme commit --no-verify -qm "boxme baseline" || true
 git tag -f boxme-baseline HEAD >/dev/null
 echo ">> repo unpacked, baseline tagged"
 "#;
@@ -106,16 +114,22 @@ echo ">> using node $(node -v)"
     )
 }
 
-/// File manifest of /workspace: every entry's path/size/type, then an md5 of
+/// File manifest of /workspace: every entry's size/type/path, then an md5 of
 /// every regular file (content hashing kills mtime noise). vendor/,
 /// node_modules/ and .git are excluded — the expected dirs are summarized by
 /// count separately.
+///
+/// Everything is NUL-delimited and the path is the last field of each record,
+/// so filenames containing tabs or newlines can't inject or truncate manifest
+/// lines (a guest-controlled name must not be able to forge a review entry).
+/// `md5sum -z` likewise NUL-terminates and disables its backslash-escaping of
+/// special characters in names.
 pub const MANIFEST: &str = r#"
 cd /workspace
-echo '#FILES'
-find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -printf '%P\t%s\t%y\n' | sort
-echo '#MD5'
-find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -type f -print0 | xargs -0 -r md5sum
+printf '#FILES\0'
+find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -printf '%s\t%y\t%P\0'
+printf '#MD5\0'
+find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -type f -print0 | xargs -0 -r md5sum -z
 "#;
 
 /// Count files inside an expected dir (for the "vendor/: 4321 files" summary).

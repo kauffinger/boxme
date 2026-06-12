@@ -36,10 +36,26 @@ impl FileItem {
     }
 }
 
+/// One network row in the review. In a learn run the unexpected, named hosts are
+/// `selectable` and toggling `selected` adds them to the allowlist.
+#[derive(Debug, Clone)]
+pub struct NetRow {
+    pub contact: NetworkContact,
+    pub selectable: bool,
+    pub selected: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Approve,
     Abort,
+}
+
+/// What the review returns: the decision plus, for a learn run, the hosts the
+/// user chose to trust.
+pub struct Outcome {
+    pub decision: Decision,
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +66,9 @@ enum Tab {
 
 pub struct Review {
     pub files: Vec<FileItem>,
-    pub network: Vec<NetworkContact>,
+    pub network: Vec<NetRow>,
+    /// Learn run: the Network tab shows checkboxes and `Space` trusts a host.
+    pub network_selectable: bool,
     /// Banner instead of contacts when the capture was unavailable/unreadable.
     pub network_banner: Option<String>,
     pub exit_code: i32,
@@ -65,10 +83,10 @@ struct App {
     diff_scroll: u16,
 }
 
-/// Full-screen review; returns the user's decision. The interactive attach has
-/// already restored cooked mode, but raw mode toggling is idempotent so we
-/// disable defensively first.
-pub fn run(review: Review) -> Result<Decision> {
+/// Full-screen review; returns the user's decision (and trusted hosts). The
+/// interactive attach has already restored cooked mode, but raw mode toggling
+/// is idempotent so we disable defensively first.
+pub fn run(review: Review) -> Result<Outcome> {
     let _ = crossterm::terminal::disable_raw_mode();
     let mut terminal = ratatui::init();
     let mut app = App {
@@ -106,6 +124,7 @@ pub fn run(review: Review) -> Result<Decision> {
                     Tab::Network => Tab::Files,
                 };
             }
+            (KeyCode::Char(' '), _) if matches!(app.tab, Tab::Network) => app.toggle_net(),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
                 app.select(1);
             }
@@ -118,8 +137,19 @@ pub fn run(review: Review) -> Result<Decision> {
         }
     };
 
+    let allow = if decision == Decision::Approve {
+        app.review
+            .network
+            .iter()
+            .filter(|r| r.selectable && r.selected)
+            .filter_map(|r| r.contact.domain.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     ratatui::restore();
-    Ok(decision)
+    Ok(Outcome { decision, allow })
 }
 
 impl App {
@@ -136,6 +166,21 @@ impl App {
         state.select(Some(next));
         if matches!(self.tab, Tab::Files) {
             self.diff_scroll = 0;
+        }
+    }
+
+    fn toggle_net(&mut self) {
+        if !self.review.network_selectable {
+            return;
+        }
+        if let Some(row) = self
+            .net_state
+            .selected()
+            .and_then(|i| self.review.network.get_mut(i))
+        {
+            if row.selectable {
+                row.selected = !row.selected;
+            }
         }
     }
 }
@@ -156,7 +201,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         Tab::Network => draw_network(f, app, chunks[1]),
     }
 
-    let hints = " ↑↓/jk select   Tab switch tab   PgUp/PgDn scroll diff   a approve   q abort ";
+    let hints = if app.review.network_selectable {
+        " ↑↓/jk select   Tab switch tab   Space trust host   a approve   q abort "
+    } else {
+        " ↑↓/jk select   Tab switch tab   PgUp/PgDn scroll diff   a approve   q abort "
+    };
     f.render_widget(
         Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
@@ -165,7 +214,12 @@ fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let unexpected_files = app.review.files.iter().filter(|i| !i.expected()).count();
-    let unexpected_net = app.review.network.iter().filter(|c| !c.known).count();
+    let unexpected_net = app
+        .review
+        .network
+        .iter()
+        .filter(|r| !r.contact.known)
+        .count();
 
     let mut spans = vec![Span::styled(
         format!(" {} ", app.review.command),
@@ -302,25 +356,47 @@ fn draw_network(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let selectable = app.review.network_selectable;
     let items: Vec<ListItem> = app
         .review
         .network
         .iter()
-        .map(|c| {
+        .map(|row| {
+            let c = &row.contact;
             let label = match &c.domain {
                 Some(domain) => format!("{domain} ({}) :{}", c.ip, c.port),
                 None => format!("{} :{}", c.ip, c.port),
             };
+            // Checkbox only for selectable rows in learn mode; everything else
+            // keeps a 4-space gutter so the columns line up.
+            let check = if !selectable {
+                ""
+            } else if !row.selectable {
+                "    "
+            } else if row.selected {
+                "[x] "
+            } else {
+                "[ ] "
+            };
             let (tag, style) = if c.known {
                 ("known      ", Style::default().fg(Color::Green))
+            } else if selectable && row.selected {
+                ("trusted    ", Style::default().fg(Color::Green))
             } else {
                 ("unexpected ", Style::default().fg(Color::Yellow))
             };
-            ListItem::new(format!("{tag}{label}")).style(style)
+            ListItem::new(format!("{check}{tag}{label}")).style(style)
         })
         .collect();
 
-    let title = format!(" network contacts ({}) ", app.review.network.len());
+    let title = if selectable {
+        format!(
+            " network contacts ({}) — Space trusts an unexpected host ",
+            app.review.network.len()
+        )
+    } else {
+        format!(" network contacts ({}) ", app.review.network.len())
+    };
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));

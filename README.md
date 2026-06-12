@@ -46,6 +46,7 @@ boxme npm ci
 # Global flags go BEFORE the command (everything after `composer`/`npm`
 # is passed through verbatim):
 boxme --strict composer install   # deny-by-default network: registries only
+boxme --learn composer install    # re-open the host picker to re-curate
 boxme --keep npm install          # keep the VM around afterwards
 boxme --memory 4096 --cpus 4 composer update
 
@@ -59,10 +60,48 @@ sandbox — a malicious postinstall could read it and try to send it somewhere.
 The Network tab shows every destination contacted; `--strict` limits where
 anything can go.
 
+## Deciding what the network can reach
+
+A run is one of two things: **observe** or **enforce**. UDP is always blocked
+apart from DNS; the difference is what TCP can reach.
+
+**First run in a project** (no `.boxme/allow` yet) observes: every outbound TCP
+connection succeeds and is recorded, and the review's Network tab lets you trust
+hosts. Known registries are always allowed and shown for reference; each
+*unexpected* named host gets a checkbox (`Space` to trust); a bare-IP contact
+with no resolved name can't be allowlisted — and is itself worth leaving
+blocked. On approve, your picks are saved to `.boxme/allow` and:
+
+- if the command only ever contacted hosts that are now allowed, the observe run
+  *is* the clean result and it's copied back as-is — no second run;
+- if it touched anything that enforcement would block, the command **re-runs**
+  under deny-by-default (DNS + registries + your allowlist) and *that* clean
+  result is what you review and copy back.
+
+**Every later run** in that project enforces `.boxme/allow` automatically. Add
+`--learn` to re-open the picker when a new dependency needs a new host, or just
+edit the file. `--strict` ignores the allowlist and permits only the registries
+(the tightest setting).
+
+`.boxme/allow` is one entry per line — commit it to share the decision with your
+team:
+
+```
+example.com         # the domain and every subdomain
+=api.example.com    # this exact host only
+# comments and blank lines are ignored
+```
+
+Real-time "allow this connection? [y/n]" prompting mid-run isn't offered: the
+sandbox's network policy is fixed when the VM boots, so trust is decided in the
+review between runs, not during one. Path-level rules (e.g. `github.com/org/*`)
+aren't possible either — the URL path lives inside TLS, so the policy only ever
+sees the hostname.
+
 ### Review keys
 
 `↑↓`/`jk` select · `Tab` switch Files/Network · `PgUp/PgDn` scroll diff ·
-`a` approve · `q`/`Esc` abort
+`Space` trust host (observe run) · `a` approve · `q`/`Esc` abort
 
 ## How versions are matched
 
@@ -78,9 +117,16 @@ anything can go.
 - The guest gets a git baseline commit of your tree (including uncommitted
   changes — that's exactly the state the command should operate on). Your host
   repo is never required to be a git repo and is never touched by guest git.
-- Network capture is observe-by-default; `--strict` boots the VM with a
-  deny-by-default policy allowing only DNS and the package registries over
-  HTTP(S).
+- Observe vs enforce is covered above; in both, UDP is blocked apart from DNS
+  (composer and npm need nothing else over UDP, and blocking it closes the
+  QUIC/raw-UDP exfiltration path that the SYN-based capture can't observe).
+- The composer/npm/Node caches live on named volumes shared across every
+  project boxme runs. A malicious package can write to those caches, so poisoned
+  cache content could be picked up by a later run in a *different* project.
+  Running the install as a non-root user does **not** close this: the cache has
+  to be writable by whoever runs the install, which is the same identity the
+  package code runs as. The lockfile integrity checks (npm) and `--strict` bound
+  the blast radius; per-project isolation is on the roadmap.
 - Approval is all-or-nothing in v1.
 - A nonzero exit from the command still shows the review (red banner) — abort
   is the natural choice there.
