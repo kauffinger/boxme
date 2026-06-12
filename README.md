@@ -100,8 +100,13 @@ sees the hostname.
 
 ### Review keys
 
-`↑↓`/`jk` select · `Tab` switch Files/Network · `PgUp/PgDn` scroll diff ·
-`Space` trust host (observe run) · `a` approve · `q`/`Esc` abort
+`↑↓`/`jk` select · `g`/`G` first/last · `h`/`l`/`Tab` switch Files/Network
+(`1`/`2` jump directly) · `Ctrl-d`/`Ctrl-u` half-page scroll ·
+`Ctrl-f`/`Ctrl-b`/`PgUp`/`PgDn` full-page scroll · `J`/`K` line scroll ·
+`Space` trust host (observe run) · `a` approve · `q`/`Ctrl-C` abort
+
+Scroll keys act on the diff on the Files tab and on the list on the Network
+tab. `Esc` is deliberately unbound so a reflexive press can't abort a run.
 
 ## How versions are matched
 
