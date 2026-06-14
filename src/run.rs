@@ -36,6 +36,20 @@ struct CommandRun {
     unexpected: Vec<(String, Change)>,
 }
 
+/// The per-run inputs every stage shares: which command, where, the detected
+/// toolchain versions, and the resolved guest environment. Built once in `run`
+/// and threaded through by reference.
+struct RunCtx<'a> {
+    cli: &'a Cli,
+    project_dir: &'a Path,
+    tool: &'a str,
+    args: &'a [String],
+    write_set: &'a WriteSet,
+    php: &'a str,
+    node: Option<u32>,
+    env: Vec<(String, String)>,
+}
+
 pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
     // 1. Validate + detect.
     let tool = args.first().map(String::as_str).unwrap_or("");
@@ -61,93 +75,94 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
     let env = resolve_env(&cli.env)?;
     ensure_cache_volumes().await?;
 
+    let ctx = RunCtx {
+        cli,
+        project_dir: &project_dir,
+        tool,
+        args,
+        write_set: &write_set,
+        php: &php,
+        node,
+        env,
+    };
+
     // A run learns (observe + pick) when asked to, or the first time a project
     // has no allowlist yet. Otherwise it enforces straight away: `--strict` is
     // registries-only, an existing allowlist is registries + its entries.
     if cli.learn || (!cli.strict && !allowlist::exists(&project_dir)) {
-        learn_run(cli, &project_dir, tool, args, &write_set, &php, node, &env).await
+        learn_run(&ctx).await
     } else {
         let policy = if cli.strict {
             strict_policy()
         } else {
             enforced_policy(&allowlist::load(&project_dir))
         };
-        enforced_run(cli, &project_dir, tool, args, &write_set, &php, node, &env, policy).await
+        enforced_run(&ctx, policy).await
     }
 }
 
 /// Observe the command with the network open, let the user trust hosts in the
 /// review, save them, then either copy back directly (if nothing it touched
 /// would be blocked) or re-run under enforcement for a clean result.
-#[allow(clippy::too_many_arguments)]
-async fn learn_run(
-    cli: &Cli,
-    project_dir: &Path,
-    tool: &str,
-    args: &[String],
-    write_set: &WriteSet,
-    php: &str,
-    node: Option<u32>,
-    env: &[(String, String)],
-) -> Result<()> {
+async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
     eprintln!(
         "{}",
         ">> learn: observing this run to build the allowlist".dimmed()
     );
-    let (sb, name) = boot(cli, env, observe_policy(), vm_name(project_dir)).await?;
+    let (sb, name) = boot(ctx, observe_policy(), vm_name(ctx.project_dir)).await?;
 
-    let mut run = match run_command(&sb, project_dir, tool, args, write_set, php, node).await {
-        Ok(run) => run,
-        Err(e) => {
-            discard(sb, &name).await;
-            return Err(e);
+    // Everything that can fail before the teardown decision runs here, so the
+    // observe VM is discarded in exactly one place on the error path. `None`
+    // means the user aborted the review.
+    let staged = async {
+        let mut run = run_command(&sb, ctx).await?;
+        let outcome = review::run(Review {
+            files: std::mem::take(&mut run.files),
+            network: net_rows(&run.network, true),
+            network_selectable: true,
+            network_banner: run.network_banner.clone(),
+            exit_code: run.exit_code,
+            command: run.command.clone(),
+        })?;
+        if outcome.decision == Decision::Abort {
+            return Ok(None);
         }
-    };
-
-    let review = review::run(Review {
-        files: std::mem::take(&mut run.files),
-        network: net_rows(&run.network, true),
-        network_selectable: true,
-        network_banner: run.network_banner.clone(),
-        exit_code: run.exit_code,
-        command: run.command.clone(),
-    });
-    let outcome = match review {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            discard(sb, &name).await;
-            return Err(e);
-        }
-    };
-
-    if outcome.decision == Decision::Abort {
-        discard(sb, &name).await;
-        eprintln!("{}", "aborted — no allowlist written, nothing copied back".red());
-        return Ok(());
+        // Persist the picks; this creates the file even with no extra hosts, so
+        // future runs in this project enforce by default.
+        let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
+        Ok::<_, anyhow::Error>(Some((run, merged)))
     }
+    .await;
 
-    // Persist the picks; this creates the file even with no extra hosts, so
-    // future runs in this project enforce by default.
-    let merged = match allowlist::save_merged(project_dir, &outcome.allow) {
-        Ok(merged) => merged,
+    let (run, merged) = match staged {
+        Ok(Some(staged)) => staged,
+        Ok(None) => {
+            discard(sb, &name).await;
+            eprintln!(
+                "{}",
+                "aborted — no allowlist written, nothing copied back".red()
+            );
+            return Ok(());
+        }
         Err(e) => {
             discard(sb, &name).await;
             return Err(e);
         }
     };
+
     eprintln!(
         "{} {} extra host(s) → {}",
         ">> learn: allowlist saved,".dimmed(),
         merged.len(),
-        allowlist::path(project_dir).display(),
+        allowlist::path(ctx.project_dir).display(),
     );
 
     // If everything the command contacted is allowed under enforcement, the
     // observe run already is the clean result — copy it back without a re-run.
     let blocked = blocked_hosts(&run.network, &merged);
     if blocked.is_empty() {
-        let result = copy_back(&sb, project_dir, write_set, &run).await;
-        cleanup(cli, sb, &name).await;
+        let result = copy_back(&sb, ctx.project_dir, ctx.write_set, &run).await;
+        cleanup(ctx.cli, sb, &name).await;
         result?;
         eprintln!("{}", "approved — results copied into the project".green());
         return Ok(());
@@ -159,63 +174,39 @@ async fn learn_run(
         blocked.join(", ").dimmed(),
     );
     discard(sb, &name).await;
-    enforced_run(
-        cli,
-        project_dir,
-        tool,
-        args,
-        write_set,
-        php,
-        node,
-        env,
-        enforced_policy(&merged),
-    )
-    .await
+    enforced_run(ctx, enforced_policy(&merged)).await
 }
 
 /// Single-pass run under a fixed policy: boot, run, review (read-only), copy
 /// back on approval.
-#[allow(clippy::too_many_arguments)]
-async fn enforced_run(
-    cli: &Cli,
-    project_dir: &Path,
-    tool: &str,
-    args: &[String],
-    write_set: &WriteSet,
-    php: &str,
-    node: Option<u32>,
-    env: &[(String, String)],
-    policy: NetworkPolicy,
-) -> Result<()> {
-    let (sb, name) = boot(cli, env, policy, vm_name(project_dir)).await?;
+async fn enforced_run(ctx: &RunCtx<'_>, policy: NetworkPolicy) -> Result<()> {
+    let (sb, name) = boot(ctx, policy, vm_name(ctx.project_dir)).await?;
     let outcome = async {
-        let run = run_command(&sb, project_dir, tool, args, write_set, php, node).await?;
-        finish_review(&sb, project_dir, write_set, run).await
+        let run = run_command(&sb, ctx).await?;
+        finish_review(&sb, ctx.project_dir, ctx.write_set, run).await
     }
     .await;
-    cleanup(cli, sb, &name).await;
+    cleanup(ctx.cli, sb, &name).await;
     outcome
 }
 
 /// Run the package-manager command in an already-booted guest and gather the
 /// before/after manifest diff and network capture. Does not review or copy back.
-#[allow(clippy::too_many_arguments)]
-async fn run_command(
-    sb: &Sandbox,
-    project_dir: &Path,
-    tool: &str,
-    args: &[String],
-    write_set: &WriteSet,
-    php: &str,
-    node: Option<u32>,
-) -> Result<CommandRun> {
+async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
+    let (tool, args, write_set, php, node, project_dir) = (
+        ctx.tool,
+        ctx.args,
+        ctx.write_set,
+        ctx.php,
+        ctx.node,
+        ctx.project_dir,
+    );
     let command_line = args.join(" ");
 
     // Unpack the project into /workspace and tag the guest baseline.
     eprintln!("{}", ">> packing project...".dimmed());
     let tarball = std::env::temp_dir().join(format!("boxme-{}.tgz", std::process::id()));
-    let tarball_str = tarball.to_string_lossy().to_string();
-    tar_directory(&project_dir.to_string_lossy(), &tarball_str).await?;
+    tar_directory(project_dir, &tarball).await?;
     sb.fs()
         .copy_from_host(&tarball, "/tmp/repo.tgz")
         .await
@@ -318,7 +309,7 @@ async fn run_command(
                 diff: fetch_diff(sb, path, change).await,
             });
         } else {
-            unexpected.push((path.clone(), change.clone()));
+            unexpected.push((path.clone(), *change));
         }
     }
 
@@ -429,8 +420,7 @@ fn net_rows(contacts: &[NetworkContact], learn: bool) -> Vec<NetRow> {
     let mut seen = BTreeSet::new();
     let mut rows = Vec::new();
     for c in contacts {
-        let host = c.domain.clone().unwrap_or_else(|| c.ip.clone());
-        if !seen.insert(host) {
+        if !seen.insert(c.host().to_string()) {
             continue;
         }
         let selectable = learn && !c.known && c.domain.is_some();
@@ -452,7 +442,7 @@ fn blocked_hosts(contacts: &[NetworkContact], allow: &[String]) -> Vec<String> {
         if contact_allowed(c, allow) {
             continue;
         }
-        let host = c.domain.clone().unwrap_or_else(|| c.ip.clone());
+        let host = c.host().to_string();
         if seen.insert(host.clone()) {
             blocked.push(host);
         }
@@ -472,8 +462,8 @@ fn contact_allowed(c: &NetworkContact, allow: &[String]) -> bool {
     }
 }
 
-fn lookup<'a>(changes: &'a [(String, Change)], path: &str) -> Option<&'a Change> {
-    changes.iter().find(|(p, _)| p == path).map(|(_, c)| c)
+fn lookup(changes: &[(String, Change)], path: &str) -> Option<Change> {
+    changes.iter().find(|(p, _)| p == path).map(|(_, c)| *c)
 }
 
 /// Unified diff for one changed path. New files are untracked (the baseline
@@ -514,24 +504,19 @@ fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
 }
 
 /// Boot a guest from the base snapshot under `policy`, mounting the shared
-/// caches and injecting `env`.
-async fn boot(
-    cli: &Cli,
-    env: &[(String, String)],
-    policy: NetworkPolicy,
-    name: String,
-) -> Result<(Sandbox, String)> {
+/// caches and injecting the run's environment.
+async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(Sandbox, String)> {
     eprintln!("{} '{name}' from {BASE_SNAPSHOT}...", ">> booting".dimmed());
     let mut builder = Sandbox::builder(name.as_str())
         .from_snapshot(BASE_SNAPSHOT)
-        .memory(cli.memory)
-        .cpus(cli.cpus)
+        .memory(ctx.cli.memory)
+        .cpus(ctx.cli.cpus)
         .replace()
         .volume("/root/.composer/cache", |m| m.named("boxme-composer-cache"))
         .volume("/root/.npm", |m| m.named("boxme-npm-cache"))
         .volume("/root/.n", |m| m.named("boxme-node-versions"))
         .network(|n| n.policy(policy));
-    for (key, value) in env {
+    for (key, value) in &ctx.env {
         builder = builder.env(key, value);
     }
     let sb = builder.create().await?;
@@ -544,37 +529,35 @@ async fn cleanup(cli: &Cli, sb: Sandbox, name: &str) {
         eprintln!("{} VM kept running as '{name}'", ">> --keep:".dimmed());
         sb.detach().await;
     } else {
-        let _ = sb.stop().await;
-        drop(sb);
-        if let Err(e) = Sandbox::remove(name).await {
-            eprintln!("warning: could not remove VM '{name}': {e}");
-        }
+        remove_vm(sb, name, "VM").await;
     }
 }
 
 /// Unconditionally remove a VM (ignores `--keep`) — used for the throwaway
 /// observe VM once a learn run decides to re-run under enforcement.
 async fn discard(sb: Sandbox, name: &str) {
+    remove_vm(sb, name, "observe VM").await;
+}
+
+/// Stop and remove a VM. `Sandbox::remove` operates by name, so the local
+/// handle is dropped first to release it before removal.
+async fn remove_vm(sb: Sandbox, name: &str, label: &str) {
     let _ = sb.stop().await;
     drop(sb);
     if let Err(e) = Sandbox::remove(name).await {
-        eprintln!("warning: could not remove observe VM '{name}': {e}");
+        eprintln!("warning: could not remove {label} '{name}': {e}");
     }
 }
 
 /// Named volumes must exist before a sandbox can mount them.
 async fn ensure_cache_volumes() -> Result<()> {
-    let existing: Vec<String> = Volume::list()
-        .await?
-        .iter()
-        .map(|v| v.name().to_string())
-        .collect();
+    let existing = Volume::list().await?;
     for name in [
         "boxme-composer-cache",
         "boxme-npm-cache",
         "boxme-node-versions",
     ] {
-        if !existing.iter().any(|n| n == name) {
+        if !existing.iter().any(|v| v.name() == name) {
             Volume::builder(name).create().await?;
         }
     }

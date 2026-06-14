@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::netcap::NetworkContact;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     /// "vendor/: 4321 files" — inside the expected write-set, shown as a count.
     ExpectedSummary,
@@ -94,7 +94,6 @@ struct App {
 /// is idempotent so we disable defensively first.
 pub fn run(review: Review) -> Result<Outcome> {
     let _ = crossterm::terminal::disable_raw_mode();
-    let mut terminal = ratatui::init();
     let mut app = App {
         review,
         tab: Tab::Files,
@@ -111,11 +110,34 @@ pub fn run(review: Review) -> Result<Outcome> {
         app.net_state.select(Some(0));
     }
 
-    let decision = loop {
-        terminal.draw(|f| draw(f, &mut app))?;
-        if !crossterm::event::poll(std::time::Duration::from_millis(50))? {
-            continue;
-        }
+    // Restore the terminal whether the loop returns a decision or an error — an
+    // error mid-draw must not strand the user in raw mode on the alt screen.
+    let mut terminal = ratatui::init();
+    let decision = event_loop(&mut terminal, &mut app);
+    ratatui::restore();
+    let decision = decision?;
+
+    let allow = if decision == Decision::Approve {
+        app.review
+            .network
+            .iter()
+            .filter(|r| r.selectable && r.selected)
+            .filter_map(|r| r.contact.domain.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(Outcome { decision, allow })
+}
+
+/// The draw/input loop, split out so `run` can restore the terminal on the
+/// error path as well as the normal one.
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<Decision> {
+    loop {
+        terminal.draw(|f| draw(f, app))?;
+        // Block until input arrives; nothing in the review animates, so there's
+        // no reason to wake on a timer.
         let Event::Key(key) = crossterm::event::read()? else {
             continue;
         };
@@ -125,9 +147,9 @@ pub fn run(review: Review) -> Result<Outcome> {
         // Esc is deliberately unbound: vim users press it reflexively, and a
         // single keystroke must not abort a run that took minutes to produce.
         match (key.code, key.modifiers) {
-            (KeyCode::Char('a'), KeyModifiers::NONE) => break Decision::Approve,
-            (KeyCode::Char('q'), KeyModifiers::NONE) => break Decision::Abort,
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Decision::Abort,
+            (KeyCode::Char('a'), KeyModifiers::NONE) => return Ok(Decision::Approve),
+            (KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(Decision::Abort),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(Decision::Abort),
             (KeyCode::Tab, _)
             | (KeyCode::BackTab, _)
             | (KeyCode::Char('h'), KeyModifiers::NONE)
@@ -151,21 +173,7 @@ pub fn run(review: Review) -> Result<Outcome> {
             }
             _ => {}
         }
-    };
-
-    let allow = if decision == Decision::Approve {
-        app.review
-            .network
-            .iter()
-            .filter(|r| r.selectable && r.selected)
-            .filter_map(|r| r.contact.domain.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    ratatui::restore();
-    Ok(Outcome { decision, allow })
+    }
 }
 
 impl App {
@@ -322,7 +330,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn file_style(kind: &FileKind) -> Style {
+fn file_style(kind: FileKind) -> Style {
     match kind {
         FileKind::ExpectedSummary | FileKind::ExpectedFile => Style::default().fg(Color::Green),
         FileKind::Added | FileKind::Modified | FileKind::Binary => {
@@ -351,7 +359,7 @@ fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
                 FileKind::Deleted => "- ",
                 FileKind::Binary => "* ",
             };
-            ListItem::new(format!("{prefix}{}", item.label)).style(file_style(&item.kind))
+            ListItem::new(format!("{prefix}{}", item.label)).style(file_style(item.kind))
         })
         .collect();
 

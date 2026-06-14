@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use microsandbox::sandbox::exec::ExecEvent;
@@ -115,9 +116,9 @@ pub async fn shell_capture(sb: &Sandbox, script: &str) -> Result<String> {
 /// in one shot and unpacked there. Uses the `tar`/`flate2` crates (no host `tar`
 /// binary) and runs the compression on a blocking thread so it never stalls the
 /// async runtime — a large project tree can take a while.
-pub async fn tar_directory(dir: &str, out_tgz: &str) -> Result<()> {
-    let dir = dir.to_string();
-    let out = out_tgz.to_string();
+pub async fn tar_directory(dir: &Path, out_tgz: &Path) -> Result<()> {
+    let dir = dir.to_path_buf();
+    let out = out_tgz.to_path_buf();
     let label = dir.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let file = std::fs::File::create(&out)?;
@@ -146,5 +147,5 @@ pub async fn tar_directory(dir: &str, out_tgz: &str) -> Result<()> {
         Ok(())
     })
     .await
-    .with_context(|| format!("packing {label} failed"))?
+    .with_context(|| format!("packing {} failed", label.display()))?
 }

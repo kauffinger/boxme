@@ -64,7 +64,7 @@ pub fn parse(output: &str) -> Manifest {
     manifest
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
     Added,
     Modified,
@@ -110,10 +110,12 @@ pub struct WriteSet {
 impl WriteSet {
     pub fn contains(&self, path: &str) -> bool {
         self.files.contains(&path)
-            || self
-                .dirs
-                .iter()
-                .any(|d| path == *d || path.starts_with(&format!("{d}/")))
+            || self.dirs.iter().any(|d| {
+                path == *d
+                    || path
+                        .strip_prefix(*d)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
     }
 }
 
@@ -173,7 +175,10 @@ mod tests {
         let json = manifest.get("composer.json").unwrap();
         assert_eq!(json.kind, 'f');
         assert_eq!(json.size, 12);
-        assert_eq!(json.md5.as_deref(), Some("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(
+            json.md5.as_deref(),
+            Some("d41d8cd98f00b204e9800998ecf8427e")
+        );
         assert_eq!(manifest.get("src").unwrap().kind, 'd');
     }
 

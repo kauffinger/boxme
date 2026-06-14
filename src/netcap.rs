@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use microsandbox::sandbox::exec::{ExecControl, ExecEvent};
 use microsandbox::Sandbox;
+use tokio::task::JoinHandle;
 
 use crate::scripts::{TCPDUMP_PARSE, TCPDUMP_START};
 use crate::util::shell_capture;
@@ -39,10 +40,18 @@ pub struct NetworkContact {
     pub known: bool,
 }
 
+impl NetworkContact {
+    /// Identity for dedup and display: the resolved domain if there is one,
+    /// otherwise the bare IP.
+    pub fn host(&self) -> &str {
+        self.domain.as_deref().unwrap_or(&self.ip)
+    }
+}
+
 /// A running in-guest tcpdump. Kill it before parsing the capture.
 pub struct Capture {
     control: ExecControl,
-    exited: Arc<AtomicBool>,
+    task: JoinHandle<()>,
 }
 
 /// Start tcpdump in the guest and give it a moment to come up. `None` means
@@ -56,9 +65,10 @@ pub async fn start(sb: &Sandbox) -> Option<Capture> {
     let control = handle.control();
     let exited = Arc::new(AtomicBool::new(false));
     let exited_flag = exited.clone();
-    // Drain events in the background; all we need to know is whether tcpdump
-    // died early (missing binary, bad filter).
-    tokio::spawn(async move {
+    // Drain events in the background; the task ends when the stream closes (i.e.
+    // tcpdump exits). The flag lets the startup probe below notice an early
+    // death — missing binary, bad filter.
+    let task = tokio::spawn(async move {
         while let Some(event) = handle.recv().await {
             if matches!(event, ExecEvent::Exited { .. } | ExecEvent::Failed(_)) {
                 exited_flag.store(true, Ordering::SeqCst);
@@ -70,19 +80,15 @@ pub async fn start(sb: &Sandbox) -> Option<Capture> {
     if exited.load(Ordering::SeqCst) {
         return None;
     }
-    Some(Capture { control, exited })
+    Some(Capture { control, task })
 }
 
 impl Capture {
-    /// SIGTERM tcpdump (flushes the pcap thanks to -U) and wait briefly.
+    /// SIGTERM tcpdump (flushes the pcap thanks to -U) and wait for the drain
+    /// task to finish, bounded so a stuck guest can't hang the run.
     pub async fn stop(self) {
         let _ = self.control.signal(15).await;
-        for _ in 0..20 {
-            if self.exited.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.task).await;
     }
 }
 
@@ -157,7 +163,7 @@ fn parse_tcpdump_text(text: &str) -> Vec<NetworkContact> {
             let known = domain.as_deref().is_some_and(|d| {
                 KNOWN_SUFFIXES
                     .iter()
-                    .any(|s| d == *s || d.ends_with(&format!(".{s}")))
+                    .any(|s| d == *s || d.strip_suffix(*s).is_some_and(|rest| rest.ends_with('.')))
             });
             NetworkContact {
                 domain,
@@ -197,8 +203,14 @@ fn split_ip_port(s: &str) -> Option<(String, u16)> {
     Some((ip.to_string(), port))
 }
 
+/// The guest's own loopback and the slirp gateway range (10.0.2.0/24) aren't
+/// real outbound contacts — filter them out of the SYN list.
 fn is_local(ip: &str) -> bool {
-    ip.starts_with("127.") || ip == "::1" || ip.starts_with("10.0.2.")
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback() || matches!(v4.octets(), [10, 0, 2, _]),
+        Ok(IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

@@ -32,7 +32,12 @@ pub fn exists(project_dir: &Path) -> bool {
 pub fn entry_matches(entry: &str, host: &str) -> bool {
     match entry.strip_prefix('=') {
         Some(exact) => host == exact,
-        None => host == entry || host.ends_with(&format!(".{entry}")),
+        None => {
+            host == entry
+                || host
+                    .strip_suffix(entry)
+                    .is_some_and(|rest| rest.ends_with('.'))
+        }
     }
 }
 
