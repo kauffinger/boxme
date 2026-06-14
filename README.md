@@ -21,7 +21,10 @@ What happens:
    - **Files**: the expected write-set (`vendor/`, lockfiles) summarized,
      anything *outside* it itemized with inline diffs;
    - **Network**: every destination contacted, classified known registry vs
-     unexpected.
+     unexpected;
+   - **Outside**: anything the command wrote *outside* `/workspace` (a binary in
+     `/usr/local/bin`, a key in `/root/.ssh`, ...) — a supply-chain red flag.
+     These are reported only, never copied back.
 5. Only on `a` (approve) is the result copied back into your repo. `q` aborts
    and nothing lands.
 
@@ -100,13 +103,16 @@ sees the hostname.
 
 ### Review keys
 
-`↑↓`/`jk` select · `g`/`G` first/last · `h`/`l`/`Tab` switch Files/Network
-(`1`/`2` jump directly) · `Ctrl-d`/`Ctrl-u` half-page scroll ·
+`↑↓`/`jk` select · `g`/`G` first/last · `h`/`l`/`Tab` switch Files/Network/Outside
+(`1`/`2`/`3` jump directly) · `Ctrl-d`/`Ctrl-u` half-page scroll ·
 `Ctrl-f`/`Ctrl-b`/`PgUp`/`PgDn` full-page scroll · `J`/`K` line scroll ·
-`Space` trust host (observe run) · `a` approve · `q`/`Ctrl-C` abort
+`c` expand a truncated command · `Space` trust host (observe run) ·
+`a` approve · `q`/`Ctrl-C` abort
 
-Scroll keys act on the diff on the Files tab and on the list on the Network
-tab. `Esc` is deliberately unbound so a reflexive press can't abort a run.
+A long command line is truncated with `…` in the header so the tabs stay visible;
+`c` toggles the full command, wrapped below the tabs. Scroll keys act on the diff
+on the Files tab and on the list on the Network and Outside tabs. `Esc` is
+deliberately unbound so a reflexive press can't abort a run.
 
 ## How versions are matched
 

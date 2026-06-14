@@ -137,6 +137,36 @@ pub fn count_files(dir: &str) -> String {
     format!("find /workspace/{dir} -type f 2>/dev/null | wc -l")
 }
 
+/// Marker whose mtime is the cutoff for the out-of-workspace change scan.
+/// Touched after setup (unpack, version switch) but before the command, so the
+/// scan reports only what the command itself wrote outside /workspace.
+pub const BASELINE_MARKER: &str = "/root/.boxme-outside-baseline";
+
+/// Files changed anywhere outside /workspace since the baseline marker. The test
+/// is `-newercm`: a file's inode-change time (ctime) is newer than the marker's
+/// mtime. ctime can't be backdated with `touch -t` from inside the guest, so
+/// this also catches chmod/chown/rename and binary replacement, not just writes.
+///
+/// `-xdev` keeps the walk on the rootfs, which already skips the mounted cache
+/// volumes (/root/.composer/cache, /root/.npm, /root/.n) and the pseudo-fs. The
+/// explicit prunes drop /workspace (covered by the Files tab) plus the scratch
+/// and cache dirs composer/npm legitimately churn every run; trading a little
+/// blind spot in those for signal in the rest of the tree. Output is
+/// `size\ttype\tpath`; a missing marker prints `#NOMARKER`.
+pub fn outside_scan() -> String {
+    format!(
+        r#"marker={BASELINE_MARKER}
+if [ ! -e "$marker" ]; then echo '#NOMARKER'; exit 0; fi
+find / -xdev -mindepth 1 \
+  \( -path /workspace -o -path /proc -o -path /sys -o -path /dev -o -path /run \
+     -o -path /tmp -o -path /var/tmp -o -path /var/log -o -path /var/cache \
+     -o -path /var/lib/apt -o -path /root/.cache -o -path /root/.npm \
+     -o -path /root/.composer -o -path /root/.n \) -prune -o \
+  \( -newercm "$marker" -a \( -type f -o -type l \) -printf '%s\t%y\t%p\n' \) 2>/dev/null
+"#
+    )
+}
+
 /// tcpdump capturing DNS + outbound TCP SYNs. `-U` flushes per packet so a
 /// SIGTERM loses nothing; `exec` so killing the exec kills tcpdump itself.
 pub const TCPDUMP_START: &str =

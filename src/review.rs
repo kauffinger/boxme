@@ -7,6 +7,11 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use ratatui::Frame;
 
 use crate::netcap::NetworkContact;
+use crate::outside::{SysFile, SysKind};
+
+/// Cap on how many lines the expanded command view (toggled with `c`) takes, so
+/// a pathological command can't swallow the whole header.
+const MAX_FULL_CMD_LINES: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -62,6 +67,7 @@ pub struct Outcome {
 enum Tab {
     Files,
     Network,
+    Outside,
 }
 
 pub struct Review {
@@ -71,6 +77,12 @@ pub struct Review {
     pub network_selectable: bool,
     /// Banner instead of contacts when the capture was unavailable/unreadable.
     pub network_banner: Option<String>,
+    /// Paths the command wrote outside /workspace — a supply-chain signal.
+    pub outside: Vec<SysFile>,
+    /// Banner instead of the list when the out-of-workspace scan couldn't run.
+    pub outside_banner: Option<String>,
+    /// The scan hit its cap; more paths changed than are shown.
+    pub outside_truncated: bool,
     pub exit_code: i32,
     pub command: String,
 }
@@ -80,6 +92,7 @@ struct App {
     tab: Tab,
     file_state: ListState,
     net_state: ListState,
+    out_state: ListState,
     diff_scroll: u16,
     /// Inner height of the body pane, captured during draw so paging keys
     /// match the actual viewport.
@@ -87,6 +100,8 @@ struct App {
     /// Wrapped line count of the current diff, captured during draw so
     /// scrolling clamps at the end.
     diff_lines: u16,
+    /// `c` toggles this to expand a truncated command to its full wrapped form.
+    show_full_command: bool,
 }
 
 /// Full-screen review; returns the user's decision (and trusted hosts). The
@@ -99,15 +114,20 @@ pub fn run(review: Review) -> Result<Outcome> {
         tab: Tab::Files,
         file_state: ListState::default(),
         net_state: ListState::default(),
+        out_state: ListState::default(),
         diff_scroll: 0,
         page_height: 0,
         diff_lines: 0,
+        show_full_command: false,
     };
     if !app.review.files.is_empty() {
         app.file_state.select(Some(0));
     }
     if !app.review.network.is_empty() {
         app.net_state.select(Some(0));
+    }
+    if !app.review.outside.is_empty() {
+        app.out_state.select(Some(0));
     }
 
     // Restore the terminal whether the loop returns a decision or an error — an
@@ -156,6 +176,10 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
             | (KeyCode::Char('l'), KeyModifiers::NONE) => app.switch_tab(),
             (KeyCode::Char('1'), KeyModifiers::NONE) => app.tab = Tab::Files,
             (KeyCode::Char('2'), KeyModifiers::NONE) => app.tab = Tab::Network,
+            (KeyCode::Char('3'), KeyModifiers::NONE) => app.tab = Tab::Outside,
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                app.show_full_command = !app.show_full_command
+            }
             (KeyCode::Char(' '), _) if matches!(app.tab, Tab::Network) => app.toggle_net(),
             (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => app.select(1),
             (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => app.select(-1),
@@ -181,6 +205,7 @@ impl App {
         match self.tab {
             Tab::Files => (&mut self.file_state, self.review.files.len()),
             Tab::Network => (&mut self.net_state, self.review.network.len()),
+            Tab::Outside => (&mut self.out_state, self.review.outside.len()),
         }
     }
 
@@ -208,7 +233,8 @@ impl App {
     fn switch_tab(&mut self) {
         self.tab = match self.tab {
             Tab::Files => Tab::Network,
-            Tab::Network => Tab::Files,
+            Tab::Network => Tab::Outside,
+            Tab::Outside => Tab::Files,
         };
     }
 
@@ -220,7 +246,7 @@ impl App {
                 let max = self.diff_lines.saturating_sub(self.page_height) as i32;
                 self.diff_scroll = (i32::from(self.diff_scroll) + delta).clamp(0, max) as u16;
             }
-            Tab::Network => self.select(delta as i64),
+            Tab::Network | Tab::Outside => self.select(delta as i64),
         }
     }
 
@@ -249,30 +275,34 @@ impl App {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(header_height(app, area.width)),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
-        .split(f.area());
+        .split(area);
 
     draw_header(f, app, chunks[0]);
     app.page_height = chunks[1].height.saturating_sub(2);
     match app.tab {
         Tab::Files => draw_files(f, app, chunks[1]),
         Tab::Network => draw_network(f, app, chunks[1]),
+        Tab::Outside => draw_outside(f, app, chunks[1]),
     }
 
     let hints = match app.tab {
         Tab::Files => {
-            " ↑↓/jk select   g/G first/last   ^d/^u scroll diff   h/l tab   a approve   q abort "
+            " ↑↓/jk select   g/G first/last   ^d/^u scroll diff   h/l tab   c cmd   a approve   q abort "
         }
         Tab::Network if app.review.network_selectable => {
-            " ↑↓/jk select   Space trust host   h/l tab   a approve   q abort "
+            " ↑↓/jk select   Space trust host   h/l tab   c cmd   a approve   q abort "
         }
-        Tab::Network => " ↑↓/jk select   g/G first/last   h/l tab   a approve   q abort ",
+        Tab::Network | Tab::Outside => {
+            " ↑↓/jk select   g/G first/last   h/l tab   c cmd   a approve   q abort "
+        }
     };
     f.render_widget(
         Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)),
@@ -280,7 +310,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+/// The run status + tabs, always shown. Built separately from the command so
+/// the command can be measured against (or moved off) the line they share.
+fn status_spans(app: &App) -> Vec<Span<'static>> {
     let unexpected_files = app.review.files.iter().filter(|i| !i.expected()).count();
     let unexpected_net = app
         .review
@@ -288,23 +320,22 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .filter(|r| !r.contact.known)
         .count();
+    let outside_count = app.review.outside.len();
 
-    let mut spans = vec![Span::styled(
-        format!(" {} ", app.review.command),
-        Style::default().add_modifier(Modifier::BOLD),
-    )];
+    let mut tail: Vec<Span<'static>> = Vec::new();
     if app.review.exit_code == 0 {
-        spans.push(Span::styled(" exit: 0 ", Style::default().fg(Color::Green)));
+        tail.push(Span::styled(" exit: 0 ", Style::default().fg(Color::Green)));
     } else {
-        spans.push(Span::styled(
+        tail.push(Span::styled(
             format!(" exit: {} ", app.review.exit_code),
             Style::default().fg(Color::White).bg(Color::Red),
         ));
     }
-    spans.push(Span::raw("  "));
+    tail.push(Span::raw("  "));
     for (tab, label, badge) in [
         (Tab::Files, "Files", unexpected_files),
         (Tab::Network, "Network", unexpected_net),
+        (Tab::Outside, "Outside", outside_count),
     ] {
         let style = if app.tab == tab {
             Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -316,18 +347,92 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         } else {
             format!(" {label} ")
         };
-        spans.push(Span::styled(text, style));
-        spans.push(Span::raw(" "));
+        tail.push(Span::styled(text, style));
+        tail.push(Span::raw(" "));
     }
+    tail
+}
 
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" boxme review "),
-        ),
-        area,
-    );
+/// Width left for the command once the status + tabs claim their share of the
+/// header's inner width.
+fn command_budget(app: &App, width: u16) -> usize {
+    let inner = usize::from(width.saturating_sub(2));
+    let tail_width: usize = status_spans(app).iter().map(|s| s.width()).sum();
+    inner.saturating_sub(tail_width)
+}
+
+/// Header rows: 3 normally; taller only when the command is expanded (`c`) *and*
+/// is actually too long to fit beside the tabs.
+fn header_height(app: &App, width: u16) -> u16 {
+    let budget = command_budget(app, width);
+    let fits = app.review.command.chars().count() + 2 <= budget;
+    if !app.show_full_command || fits {
+        return 3;
+    }
+    let inner = usize::from(width.saturating_sub(2)).max(1);
+    let lines = command_lines(&app.review.command, inner).len();
+    (lines + 3) as u16
+}
+
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+    let tail = status_spans(app);
+    let cmd_style = Style::default().add_modifier(Modifier::BOLD);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" boxme review ");
+
+    let budget = command_budget(app, area.width);
+    let framed = format!(" {} ", app.review.command);
+    let fits = framed.chars().count() <= budget;
+
+    let paragraph = if !app.show_full_command || fits {
+        // Single line: command (truncated with … if needed) then status + tabs.
+        let cmd = if fits {
+            framed
+        } else {
+            truncate_command(&app.review.command, budget)
+        };
+        let mut spans = vec![Span::styled(cmd, cmd_style)];
+        spans.extend(tail);
+        Paragraph::new(Line::from(spans))
+    } else {
+        // Expanded: status + tabs on top, the full command wrapped below.
+        let inner = usize::from(area.width.saturating_sub(2)).max(1);
+        let mut lines = vec![Line::from(tail)];
+        for piece in command_lines(&app.review.command, inner) {
+            lines.push(Line::from(Span::styled(piece, cmd_style)));
+        }
+        Paragraph::new(lines)
+    };
+
+    f.render_widget(paragraph.block(block), area);
+}
+
+/// Fit the command into `budget` cells with a trailing ellipsis. Reserves three
+/// cells for the leading space, the `…`, and the trailing space.
+fn truncate_command(command: &str, budget: usize) -> String {
+    let keep = budget.saturating_sub(3);
+    let head: String = command.chars().take(keep).collect();
+    format!(" {head}… ")
+}
+
+/// Split the command into `width`-wide lines for the expanded view, capped at
+/// `MAX_FULL_CMD_LINES` with a `…` on the last line when it overflows.
+fn command_lines(command: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<char> = command.chars().collect();
+    let mut lines: Vec<String> = chars.chunks(width).map(|c| c.iter().collect()).collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if lines.len() > MAX_FULL_CMD_LINES {
+        lines.truncate(MAX_FULL_CMD_LINES);
+        if let Some(last) = lines.last_mut() {
+            last.pop();
+            last.push('…');
+        }
+    }
+    lines
 }
 
 fn file_style(kind: FileKind) -> Style {
@@ -486,4 +591,93 @@ fn draw_network(f: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, &mut app.net_state);
+}
+
+fn draw_outside(f: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(banner) = &app.review.outside_banner {
+        f.render_widget(
+            Paragraph::new(banner.as_str())
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().borders(Borders::ALL).title(" outside "))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+
+    if app.review.outside.is_empty() {
+        f.render_widget(
+            Paragraph::new("nothing written outside /workspace")
+                .style(Style::default().fg(Color::Green))
+                .block(Block::default().borders(Borders::ALL).title(" outside ")),
+            area,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .review
+        .outside
+        .iter()
+        .map(|file| {
+            let tag = match file.kind {
+                SysKind::File => "file",
+                SysKind::Symlink => "link",
+            };
+            ListItem::new(format!("{tag}  {:>9}  {}", human_size(file.size), file.path))
+                .style(Style::default().fg(Color::Yellow))
+        })
+        .collect();
+
+    let count = app.review.outside.len();
+    let title = if app.review.outside_truncated {
+        format!(" outside /workspace ({count}+, truncated) ")
+    } else {
+        format!(" outside /workspace ({count}) ")
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, area, &mut app.out_state);
+}
+
+/// Compact byte size for the Outside list (e.g. `12.3 KB`).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_command_fits_budget_and_marks_ellipsis() {
+        let cmd = "composer update some/really-long-package --with=flags";
+        let out = truncate_command(cmd, 12);
+        assert_eq!(out.chars().count(), 12);
+        assert!(out.starts_with(" composer"));
+        assert!(out.ends_with("… "));
+    }
+
+    #[test]
+    fn command_lines_chunks_and_caps_with_ellipsis() {
+        assert_eq!(command_lines("composer install", 80), ["composer install"]);
+
+        let long = "x".repeat(1000);
+        let lines = command_lines(&long, 10);
+        assert_eq!(lines.len(), MAX_FULL_CMD_LINES);
+        assert!(lines.iter().take(MAX_FULL_CMD_LINES - 1).all(|l| l.len() == 10));
+        assert!(lines.last().unwrap().ends_with('…'));
+    }
 }

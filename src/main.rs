@@ -4,6 +4,7 @@ mod copyback;
 mod detect;
 mod manifest;
 mod netcap;
+mod outside;
 mod review;
 mod run;
 mod scripts;

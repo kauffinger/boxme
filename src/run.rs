@@ -15,6 +15,7 @@ use crate::copyback::{self, CopyPlan};
 use crate::detect;
 use crate::manifest::{self, Change, WriteSet};
 use crate::netcap::{self, NetworkContact};
+use crate::outside::{self, OutsideScan};
 use crate::review::{self, Decision, FileItem, FileKind, NetRow, Review};
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
@@ -31,6 +32,7 @@ struct CommandRun {
     files: Vec<FileItem>,
     network: Vec<NetworkContact>,
     network_banner: Option<String>,
+    outside: OutsideScan,
     changes: Vec<(String, Change)>,
     expected_files: Vec<String>,
     unexpected: Vec<(String, Change)>,
@@ -121,6 +123,9 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
             network: net_rows(&run.network, true),
             network_selectable: true,
             network_banner: run.network_banner.clone(),
+            outside_banner: run.outside.banner(),
+            outside_truncated: run.outside.truncated,
+            outside: std::mem::take(&mut run.outside.files),
             exit_code: run.exit_code,
             command: run.command.clone(),
         })?;
@@ -236,6 +241,11 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     // Manifest before (after unpack, so extraction artifacts can't pollute).
     let before = manifest::parse(&shell_capture(sb, scripts::MANIFEST).await?);
 
+    // Stamp the out-of-workspace baseline now that setup (unpack, version
+    // switch) is done — from here, anything written outside /workspace is the
+    // command's doing. Best-effort: a missing marker just disables the scan.
+    let _ = shell_capture(sb, &format!("touch {}", scripts::BASELINE_MARKER)).await;
+
     // Network capture must be live before the command starts.
     let capture = netcap::start(sb).await;
     if capture.is_none() {
@@ -281,6 +291,12 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     // Manifest after + diff, partitioned expected vs unexpected.
     let after = manifest::parse(&shell_capture(sb, scripts::MANIFEST).await?);
     let changes = manifest::diff(&before, &after);
+
+    // Sweep for anything the command wrote outside /workspace.
+    let outside = match shell_capture(sb, &scripts::outside_scan()).await {
+        Ok(out) => outside::parse(&out),
+        Err(_) => OutsideScan::unavailable(),
+    };
 
     let mut files: Vec<FileItem> = Vec::new();
     for dir in &write_set.dirs {
@@ -344,6 +360,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
         files,
         network,
         network_banner,
+        outside,
         changes,
         expected_files,
         unexpected,
@@ -362,6 +379,9 @@ async fn finish_review(
         network: net_rows(&run.network, false),
         network_selectable: false,
         network_banner: run.network_banner.clone(),
+        outside_banner: run.outside.banner(),
+        outside_truncated: run.outside.truncated,
+        outside: std::mem::take(&mut run.outside.files),
         exit_code: run.exit_code,
         command: run.command.clone(),
     })?;
