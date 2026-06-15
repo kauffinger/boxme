@@ -55,7 +55,8 @@ cargo install --path . --locked
 Then build the base snapshot once (~10 min):
 
 ```sh
-boxme setup
+boxme setup            # 32 GiB writable guest disk by default
+boxme setup --disk 64  # bump it for very large repos (sparse, ~free until used)
 ```
 
 `boxme setup` also downloads the microsandbox runtime (the `msb` binary and
@@ -78,6 +79,12 @@ boxme --strict composer install   # deny-by-default network: registries only
 boxme --learn composer install    # re-open the host picker to re-curate
 boxme --keep npm install          # keep the VM around afterwards
 boxme --memory 4096 --cpus 4 composer update
+
+# Copy less into the sandbox (faster, smaller guest disk use) — install
+# scripts don't read these. The guest rebuilds its own git baseline, so the
+# file review is unaffected:
+boxme --without-git composer install     # -G: skip the .git directory
+boxme --without-media npm ci             # -M: skip images/video/audio/archives
 
 # Pass environment variables into the guest (private registries, auth):
 boxme -e COMPOSER_AUTH composer install      # copy host value

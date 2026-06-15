@@ -18,7 +18,7 @@ use owo_colors::OwoColorize;
 async fn main() {
     let parsed = cli::Cli::parse();
     let result = match &parsed.command {
-        cli::Command::Setup { force } => setup::setup(*force).await,
+        cli::Command::Setup { force, disk } => setup::setup(*force, *disk).await,
         cli::Command::Run(args) => run::run(&parsed, args).await,
     };
     if let Err(e) = result {

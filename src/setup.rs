@@ -40,7 +40,7 @@ async fn wait_until_stopped(name: &str) -> Result<()> {
     bail!("builder did not reach a stopped state in time")
 }
 
-pub async fn setup(force: bool) -> Result<()> {
+pub async fn setup(force: bool, disk_gib: u32) -> Result<()> {
     if !force && base_snapshot_exists().await? {
         eprintln!("base snapshot '{BASE_SNAPSHOT}' already exists — use --force to rebuild");
         return Ok(());
@@ -48,9 +48,15 @@ pub async fn setup(force: bool) -> Result<()> {
 
     ensure_runtime().await?;
 
-    eprintln!("Booting base builder from node:24...");
+    // The writable overlay is a fixed-size ext4 file baked into the snapshot;
+    // booting `from_snapshot` can't resize it, so the run-time disk ceiling is
+    // whatever we set here. ext4 is sparse, so a generous size is nearly free
+    // until used.
+    let upper_mib = disk_gib * 1024;
+    eprintln!("Booting base builder from node:24 ({disk_gib} GiB overlay)...");
     let sb = Sandbox::builder(BUILDER)
         .image("node:24")
+        .oci_upper_size(upper_mib)
         .memory(2048)
         .cpus(2)
         .replace()

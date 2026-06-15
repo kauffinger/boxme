@@ -24,7 +24,8 @@ cargo fmt                    # format
 
 cargo install --path .      # install the `boxme` binary
 boxme setup                 # install the libkrun runtime + build the boxme-base snapshot once (~10 min); required before any run
-boxme setup --force         # rebuild the snapshot (needed after changing BASE_SETUP)
+boxme setup --force         # rebuild the snapshot (needed after changing BASE_SETUP or --disk)
+boxme setup --disk 64       # build the snapshot with a 64 GiB writable overlay (default 32)
 ```
 
 ## Releasing
@@ -71,8 +72,8 @@ Entry point `main.rs` parses the CLI and dispatches to `setup::setup` or
 `run::run`. `cli.rs` uses clap derive; everything that isn't the `setup`
 subcommand falls into an `#[command(external_subcommand)] Run(Vec<String>)`,
 which is why `boxme composer i` works — global flags (`--strict`, `--learn`,
-`--keep`, `--memory`, `--cpus`, `-e`) must come *before* the package-manager
-command.
+`--keep`, `--memory`, `--cpus`, `--without-git`/`-G`, `--without-media`/`-M`,
+`-e`) must come *before* the package-manager command.
 
 `run.rs` is the orchestrator and the file to read first. It validates the tool
 is `composer`/`npm`, detects versions, then chooses one of two paths:
@@ -102,7 +103,13 @@ tag a guest git baseline → switch PHP/Node versions → snapshot the file mani
   `PREBUILT_VERSION`, into `~/.microsandbox/{bin,lib}`), then builds the
   `boxme-base` snapshot from `node:24` (one-time, slow). The runtime install is
   idempotent — a no-op once the matching version is present — so no separate
-  microsandbox CLI install is required.
+  microsandbox CLI install is required. The builder sets the writable overlay
+  (`oci_upper_size`, `--disk` GiB, default 32) — this is the *only* place the
+  per-run disk ceiling can be set, because booting `from_snapshot` inherits the
+  snapshot's fixed-size `upper.ext4` and the SDK forbids resizing it at boot. The
+  default microsandbox overlay is just 4 GiB, which a large repo + vendor +
+  node_modules + guest-local caches overruns (ENOSPC); ext4 is sparse, so a big
+  overlay costs almost nothing until used.
 - `detect.rs` — resolves guest PHP `X.Y` and Node major: host binary run from the
   project dir first (so mise/asdf/herd shims resolve per-directory), then
   manifest constraints (`composer.json` require.php, `.nvmrc`, `engines.node`),
@@ -129,7 +136,10 @@ tag a guest git baseline → switch PHP/Node versions → snapshot the file mani
 - `copyback.rs` — on approval, tars the approved paths out of the guest and
   unpacks them into the project, rejecting absolute/`..` paths and applying
   deletions only within the project dir.
-- `util.rs` — `tar_directory`, shell quoting/slugify, `shell_capture`,
+- `util.rs` — `tar_directory` (packs the project for copy-in; always skips
+  top-level `vendor/`/`node_modules/`, and a `CopyFilter` from `--without-git`/
+  `--without-media` additionally drops `.git` and media/binary assets to shrink
+  the transfer and guest disk use), shell quoting/slugify, `shell_capture`,
   `stream_shell_stderr` (streams guest exec output to the host terminal).
 
 ### Network policy & the observe/enforce model

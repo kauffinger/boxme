@@ -19,7 +19,10 @@ use crate::outside::{self, OutsideScan};
 use crate::review::{self, Decision, FileItem, FileKind, NetRow, NetStatus, Review};
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
-use crate::util::{shell_capture, shell_quote, slugify, stream_shell_stderr, tar_directory};
+use crate::util::{
+    human_bytes, shell_capture, shell_quote, slugify, stream_shell_stderr, tar_directory,
+    CopyFilter,
+};
 
 /// Fetching a unified diff per unexpected file is one guest exec each — cap it.
 const MAX_DIFFS: usize = 100;
@@ -239,8 +242,26 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
 
     // Unpack the project into /workspace and tag the guest baseline.
     eprintln!("{}", ">> packing project...".dimmed());
+    let filter = CopyFilter {
+        without_git: ctx.cli.without_git,
+        without_media: ctx.cli.without_media,
+    };
     let tarball = std::env::temp_dir().join(format!("boxme-{}.tgz", std::process::id()));
-    tar_directory(project_dir, &tarball).await?;
+    let skipped = tar_directory(project_dir, &tarball, filter).await?;
+    if filter.without_git {
+        eprintln!("{}", ">> skipped .git".dimmed());
+    }
+    if skipped.files > 0 {
+        eprintln!(
+            "{}",
+            format!(
+                ">> skipped {} media file(s), {}",
+                skipped.files,
+                human_bytes(skipped.bytes)
+            )
+            .dimmed()
+        );
+    }
     sb.fs()
         .copy_from_host(&tarball, "/tmp/repo.tgz")
         .await
