@@ -32,12 +32,34 @@ Supply-chain guards baked into the base image: the composer
 `innobrain/soak-time` plugin and npm `min-release-age=7` block dependencies
 younger than 7 days.
 
-## Setup
+## Install
 
 ```sh
-cargo install --path .
-boxme setup        # builds the boxme-base snapshot once (~10 min)
+curl -fsSL https://raw.githubusercontent.com/kauffinger/boxme/main/install.sh | sh
 ```
+
+This downloads the prebuilt binary for your platform (Apple Silicon macOS, Linux
+x86_64, Linux arm64) into `~/.local/bin` and verifies its checksum. Override the
+location with `BOXME_INSTALL_DIR`, or pin a version by passing the tag:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kauffinger/boxme/main/install.sh | sh -s -- v0.1.0
+```
+
+Or build from source (needs a Rust toolchain):
+
+```sh
+cargo install --path . --locked
+```
+
+Then build the base snapshot once (~10 min):
+
+```sh
+boxme setup
+```
+
+boxme needs hardware virtualization to boot the microVM — an Apple Silicon Mac,
+or Linux with KVM.
 
 ## Usage
 

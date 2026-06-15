@@ -27,6 +27,33 @@ boxme setup                 # build the boxme-base snapshot once (~10 min); requ
 boxme setup --force         # rebuild the snapshot (needed after changing BASE_SETUP)
 ```
 
+## Releasing
+
+Teammates install with the `curl … | sh` one-liner in `README.md`, which pulls a
+prebuilt binary from GitHub Releases. To cut a release:
+
+```sh
+# bump version in Cargo.toml, commit, then:
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` fires on any `v*` tag: it builds
+`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`
+natively (one hosted runner each — cross-compiling the microsandbox/msb_krun tree
+is not worth the pain), packages each as `boxme-<target>.tar.gz` + a `.sha256`,
+and publishes them to a Release via the runner's `gh` CLI. Builds use `--locked`
+so the `time` ceiling in `Cargo.lock` is honored. `install.sh` resolves the
+latest tag from the releases redirect (no API rate limit), downloads the matching
+tarball, and verifies the checksum before installing to `~/.local/bin`. The
+workflow can also be run manually (`workflow_dispatch`) with a tag input.
+
+`.github/workflows/ci.yml` gates pushes/PRs on `cargo fmt --check`, `clippy -D
+warnings`, and `cargo test` (one Linux runner) so a broken tree never gets
+tagged. Both workflows `apt-get install cmake pkg-config libdbus-1-dev` — the
+native build deps microsandbox pulls in (aws-lc-sys, libdbus-sys); msb_krun is
+pure Rust, so there is no libkrun system package.
+
 Tests are pure unit tests in `#[cfg(test)] mod tests` blocks (in `netcap.rs`,
 `allowlist.rs`, `manifest.rs`, `outside.rs`, `review.rs`). There is no
 integration-test harness — anything touching the sandbox is exercised by running
