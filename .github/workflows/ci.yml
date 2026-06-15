@@ -30,7 +30,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake pkg-config libdbus-1-dev
+          sudo apt-get install -y --no-install-recommends cmake pkg-config libdbus-1-dev libcap-ng-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:

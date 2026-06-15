@@ -50,9 +50,10 @@ workflow can also be run manually (`workflow_dispatch`) with a tag input.
 
 `.github/workflows/ci.yml` gates pushes/PRs on `cargo fmt --check`, `clippy -D
 warnings`, and `cargo test` (one Linux runner) so a broken tree never gets
-tagged. Both workflows `apt-get install cmake pkg-config libdbus-1-dev` — the
-native build deps microsandbox pulls in (aws-lc-sys, libdbus-sys); msb_krun is
-pure Rust, so there is no libkrun system package.
+tagged. Both workflows `apt-get install cmake pkg-config libdbus-1-dev
+libcap-ng-dev` — the native build deps microsandbox pulls in (aws-lc-sys,
+libdbus-sys, and libcap-ng, which msb_krun links for Linux capability handling).
+msb_krun is otherwise pure Rust, so there is no libkrun system package.
 
 Tests are pure unit tests in `#[cfg(test)] mod tests` blocks (in `netcap.rs`,
 `allowlist.rs`, `manifest.rs`, `outside.rs`, `review.rs`). There is no

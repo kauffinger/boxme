@@ -28,14 +28,15 @@ jobs:
       - uses: actions/checkout@v4
 
       # microsandbox pulls native build deps: aws-lc-sys (cmake + C compiler),
-      # libdbus-sys (libdbus-1-dev + pkg-config), and vendored C libs
-      # (sqlite/zstd/bzip2, served by the preinstalled gcc). msb_krun itself is
-      # pure Rust, so there is no libkrun system package to install.
+      # libdbus-sys (libdbus-1-dev + pkg-config), libcap-ng (msb_krun links it
+      # for Linux capability handling), and vendored C libs (sqlite/zstd/bzip2,
+      # served by the preinstalled gcc). msb_krun itself is pure Rust, so there
+      # is no libkrun system package to install.
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake pkg-config libdbus-1-dev
+          sudo apt-get install -y --no-install-recommends cmake pkg-config libdbus-1-dev libcap-ng-dev
 
       - name: Verify cmake (macOS)
         if: runner.os == 'macOS'
