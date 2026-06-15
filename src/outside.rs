@@ -103,10 +103,7 @@ mod tests {
         assert!(scan.available);
         assert!(!scan.truncated);
         let paths: Vec<_> = scan.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(
-            paths,
-            ["/root/.ssh/authorized_keys", "/usr/local/bin/evil"]
-        );
+        assert_eq!(paths, ["/root/.ssh/authorized_keys", "/usr/local/bin/evil"]);
         assert_eq!(scan.files[0].kind, SysKind::Symlink);
         assert_eq!(scan.files[1].size, 1024);
     }

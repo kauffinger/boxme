@@ -687,8 +687,12 @@ fn draw_outside(f: &mut Frame, app: &mut App, area: Rect) {
                 SysKind::File => "file",
                 SysKind::Symlink => "link",
             };
-            ListItem::new(format!("{tag}  {:>9}  {}", human_size(file.size), file.path))
-                .style(Style::default().fg(Color::Yellow))
+            ListItem::new(format!(
+                "{tag}  {:>9}  {}",
+                human_size(file.size),
+                file.path
+            ))
+            .style(Style::default().fg(Color::Yellow))
         })
         .collect();
 
@@ -802,7 +806,10 @@ mod tests {
         let long = "x".repeat(1000);
         let lines = command_lines(&long, 10);
         assert_eq!(lines.len(), MAX_FULL_CMD_LINES);
-        assert!(lines.iter().take(MAX_FULL_CMD_LINES - 1).all(|l| l.len() == 10));
+        assert!(lines
+            .iter()
+            .take(MAX_FULL_CMD_LINES - 1)
+            .all(|l| l.len() == 10));
         assert!(lines.last().unwrap().ends_with('…'));
     }
 }
