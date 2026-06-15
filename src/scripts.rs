@@ -120,8 +120,7 @@ echo ">> using node $(node -v)"
 /// too many open files`. The guest runs as root, so it may raise the hard limit
 /// too (a bare `ulimit -n` sets both); the fallback covers a lower kernel cap on
 /// `fs.nr_open`, and `|| true` keeps a refusal from aborting the command.
-pub const RAISE_FDS: &str =
-    "ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true";
+pub const RAISE_FDS: &str = "ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true";
 
 /// File manifest of /workspace: every entry's size/type/path, then an md5 of
 /// every regular file (content hashing kills mtime noise). vendor/,

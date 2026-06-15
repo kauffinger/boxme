@@ -136,6 +136,14 @@ ignored. Commit it to share the decision with a team.
 - VMs are booted *attached* so a crash SIGTERMs them; teardown goes through
   `cleanup`/`discard`/`remove_vm` in `run.rs`, which drop the handle before
   `Sandbox::remove` (remove operates by name). `--keep` detaches instead.
-- The base snapshot is named `boxme-base` (`setup::BASE_SNAPSHOT`); the three
-  shared cache volumes (`boxme-composer-cache`, `boxme-npm-cache`,
-  `boxme-node-versions`) are ensured before boot in `ensure_cache_volumes`.
+- The base snapshot is named `boxme-base` (`setup::BASE_SNAPSHOT`); the
+  `boxme-node-versions` volume (Node majors installed by `n`) is ensured before
+  boot in `ensure_cache_volumes` and mounted at `/root/.n`. The composer/npm
+  *download* caches are intentionally **not** mounted — they stay guest-local.
+  A mounted volume is virtiofs-backed, so each cache file the guest holds open is
+  also held open by the host `msb` VMM process, which macOS caps at
+  `kern.maxfilesperproc`; `npm` keeps tens of thousands of `_cacache` files open
+  during a large reify and overruns that cap, surfacing as `EMFILE` inside the
+  guest regardless of the guest's own `ulimit -n` (which `scripts::RAISE_FDS`
+  already raises to ~1M). Guest-local caches move that ceiling back to the guest
+  fd limit; the tradeoff is no cross-run download-cache reuse.

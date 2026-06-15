@@ -596,8 +596,21 @@ fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-/// Boot a guest from the base snapshot under `policy`, mounting the shared
-/// caches and injecting the run's environment.
+/// Boot a guest from the base snapshot under `policy`, mounting the Node-version
+/// volume and injecting the run's environment.
+///
+/// The composer/npm *download* caches are deliberately left guest-local rather
+/// than mounted from a named volume. A mounted volume is virtiofs-backed, so
+/// every cache file the guest holds open is also held open by the host `msb` VMM
+/// process — and macOS caps that process at `kern.maxfilesperproc` (61440 here).
+/// `npm` keeps tens of thousands of `_cacache` files open at once during a big
+/// reify, blowing past that ceiling and surfacing as `EMFILE` *inside* the guest,
+/// no matter how high the guest's own `ulimit -n` is. Keeping the caches on the
+/// guest's own disk moves that ceiling to the guest fd limit (raised to ~1M by
+/// `scripts::RAISE_FDS`). The cost is that the download cache no longer persists
+/// across runs. The `boxme-node-versions` volume stays mounted: it holds a
+/// handful of Node tarballs/binaries, nowhere near the fd ceiling, and re-running
+/// `n install` every time would be slow.
 async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(Sandbox, String)> {
     eprintln!("{} '{name}' from {BASE_SNAPSHOT}...", ">> booting".dimmed());
     let mut builder = Sandbox::builder(name.as_str())
@@ -605,8 +618,6 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
         .memory(ctx.cli.memory)
         .cpus(ctx.cli.cpus)
         .replace()
-        .volume("/root/.composer/cache", |m| m.named("boxme-composer-cache"))
-        .volume("/root/.npm", |m| m.named("boxme-npm-cache"))
         .volume("/root/.n", |m| m.named("boxme-node-versions"))
         .network(|n| n.policy(policy));
     for (key, value) in &ctx.env {
@@ -642,17 +653,14 @@ async fn remove_vm(sb: Sandbox, name: &str, label: &str) {
     }
 }
 
-/// Named volumes must exist before a sandbox can mount them.
+/// Named volumes must exist before a sandbox can mount them. Only the
+/// Node-version volume is mounted now (see `boot`); the composer/npm download
+/// caches stay guest-local to avoid the host's per-process file-descriptor cap.
 async fn ensure_cache_volumes() -> Result<()> {
     let existing = Volume::list().await?;
-    for name in [
-        "boxme-composer-cache",
-        "boxme-npm-cache",
-        "boxme-node-versions",
-    ] {
-        if !existing.iter().any(|v| v.name() == name) {
-            Volume::builder(name).create().await?;
-        }
+    let name = "boxme-node-versions";
+    if !existing.iter().any(|v| v.name() == name) {
+        Volume::builder(name).create().await?;
     }
     Ok(())
 }
