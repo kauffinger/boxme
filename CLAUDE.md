@@ -23,7 +23,7 @@ cargo clippy --all-targets  # lint
 cargo fmt                    # format
 
 cargo install --path .      # install the `boxme` binary
-boxme setup                 # build the boxme-base snapshot once (~10 min); required before any run
+boxme setup                 # install the libkrun runtime + build the boxme-base snapshot once (~10 min); required before any run
 boxme setup --force         # rebuild the snapshot (needed after changing BASE_SETUP)
 ```
 
@@ -97,7 +97,12 @@ tag a guest git baseline → switch PHP/Node versions → snapshot the file mani
 
 ### Module responsibilities
 
-- `setup.rs` — builds the `boxme-base` snapshot from `node:24` (one-time, slow).
+- `setup.rs` — provisions the libkrun runtime via the SDK
+  (`microsandbox::setup::install`, pinned to the linked crate's
+  `PREBUILT_VERSION`, into `~/.microsandbox/{bin,lib}`), then builds the
+  `boxme-base` snapshot from `node:24` (one-time, slow). The runtime install is
+  idempotent — a no-op once the matching version is present — so no separate
+  microsandbox CLI install is required.
 - `detect.rs` — resolves guest PHP `X.Y` and Node major: host binary run from the
   project dir first (so mise/asdf/herd shims resolve per-directory), then
   manifest constraints (`composer.json` require.php, `.nvmrc`, `engines.node`),

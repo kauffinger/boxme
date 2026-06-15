@@ -58,6 +58,10 @@ Then build the base snapshot once (~10 min):
 boxme setup
 ```
 
+`boxme setup` also downloads the microsandbox runtime (the `msb` binary and
+`libkrunfw`) into `~/.microsandbox` on first run, so you don't need a separate
+microsandbox CLI install — the runtime version is pinned to the SDK boxme links.
+
 boxme needs hardware virtualization to boot the microVM — an Apple Silicon Mac,
 or Linux with KVM.
 

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use microsandbox::sandbox::SandboxStatus;
 use microsandbox::{Sandbox, Snapshot};
 
@@ -12,6 +12,18 @@ const BUILDER: &str = "boxme-base-builder";
 pub async fn base_snapshot_exists() -> Result<bool> {
     let snapshots = Snapshot::list().await?;
     Ok(snapshots.iter().any(|s| s.name() == Some(BASE_SNAPSHOT)))
+}
+
+/// Provision the libkrun runtime (`msb` + `libkrunfw`) the SDK needs to boot
+/// microVMs, into `~/.microsandbox/{bin,lib}`. The version is pinned to the
+/// SDK's compile-time `PREBUILT_VERSION`, so the runtime always matches the
+/// linked crate — no separate microsandbox CLI install required. Idempotent: a
+/// no-op when the right version is already present, a re-download on mismatch.
+async fn ensure_runtime() -> Result<()> {
+    eprintln!("Ensuring microsandbox runtime (libkrun + msb) is installed...");
+    microsandbox::setup::install()
+        .await
+        .context("installing the microsandbox runtime (libkrun + msb)")
 }
 
 /// `stop_and_wait` can return before the runtime commits the stopped state to
@@ -33,6 +45,8 @@ pub async fn setup(force: bool) -> Result<()> {
         eprintln!("base snapshot '{BASE_SNAPSHOT}' already exists — use --force to rebuild");
         return Ok(());
     }
+
+    ensure_runtime().await?;
 
     eprintln!("Booting base builder from node:24...");
     let sb = Sandbox::builder(BUILDER)
