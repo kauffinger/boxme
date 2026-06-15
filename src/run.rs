@@ -16,7 +16,7 @@ use crate::detect;
 use crate::manifest::{self, Change, WriteSet};
 use crate::netcap::{self, NetworkContact};
 use crate::outside::{self, OutsideScan};
-use crate::review::{self, Decision, FileItem, FileKind, NetRow, Review};
+use crate::review::{self, Decision, FileItem, FileKind, NetRow, NetStatus, Review};
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
 use crate::util::{shell_capture, shell_quote, slugify, stream_shell_stderr, tar_directory};
@@ -36,6 +36,14 @@ struct CommandRun {
     changes: Vec<(String, Change)>,
     expected_files: Vec<String>,
     unexpected: Vec<(String, Change)>,
+}
+
+/// What an enforced review resolves to: either we're finished (copied back or
+/// aborted), or the user allowed blocked host(s) and wants a clean re-run under
+/// the merged allowlist.
+enum AfterReview {
+    Done,
+    Rerun(Vec<String>),
 }
 
 /// The per-run inputs every stage shares: which command, where, the detected
@@ -94,12 +102,14 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
     if cli.learn || (!cli.strict && !allowlist::exists(&project_dir)) {
         learn_run(&ctx).await
     } else {
-        let policy = if cli.strict {
-            strict_policy()
+        // --strict ignores the allowlist (registries only) and disables the
+        // allow-and-re-run affordance, since allowlisting wouldn't change it.
+        let (allow, can_trust) = if cli.strict {
+            (Vec::new(), false)
         } else {
-            enforced_policy(&allowlist::load(&project_dir))
+            (allowlist::load(&project_dir), true)
         };
-        enforced_run(&ctx, policy).await
+        enforced_run(&ctx, allow, can_trust).await
     }
 }
 
@@ -120,8 +130,9 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         let mut run = run_command(&sb, ctx).await?;
         let outcome = review::run(Review {
             files: std::mem::take(&mut run.files),
-            network: net_rows(&run.network, true),
+            network: net_rows(&run.network, learn_status),
             network_selectable: true,
+            allow_rerun: false,
             network_banner: run.network_banner.clone(),
             outside_banner: run.outside.banner(),
             outside_truncated: run.outside.truncated,
@@ -179,20 +190,38 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         blocked.join(", ").dimmed(),
     );
     discard(sb, &name).await;
-    enforced_run(ctx, enforced_policy(&merged)).await
+    enforced_run(ctx, merged, !ctx.cli.strict).await
 }
 
-/// Single-pass run under a fixed policy: boot, run, review (read-only), copy
-/// back on approval.
-async fn enforced_run(ctx: &RunCtx<'_>, policy: NetworkPolicy) -> Result<()> {
-    let (sb, name) = boot(ctx, policy, vm_name(ctx.project_dir)).await?;
+/// Deny-by-default run: boot under the allowlist, run, review, and either copy
+/// back on approval or — if the user allowed blocked hosts — re-run clean under
+/// the updated allowlist. `can_trust` is false under `--strict`, where the
+/// allowlist is ignored and allowing a host wouldn't change the next run.
+async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> Result<()> {
+    let (sb, name) = boot(ctx, enforced_policy(&allow), vm_name(ctx.project_dir)).await?;
     let outcome = async {
         let run = run_command(&sb, ctx).await?;
-        finish_review(&sb, ctx.project_dir, ctx.write_set, run).await
+        finish_review(&sb, ctx, run, &allow, can_trust).await
     }
     .await;
-    cleanup(ctx.cli, sb, &name).await;
-    outcome
+
+    // A re-run discards this VM unconditionally — like the observe VM, its result
+    // is thrown away; otherwise tear down honoring --keep.
+    match &outcome {
+        Ok(AfterReview::Rerun(_)) => discard(sb, &name).await,
+        _ => cleanup(ctx.cli, sb, &name).await,
+    }
+
+    match outcome? {
+        AfterReview::Done => Ok(()),
+        AfterReview::Rerun(merged) => {
+            eprintln!(
+                "{}",
+                ">> re-running clean under the updated allowlist".dimmed()
+            );
+            Box::pin(enforced_run(ctx, merged, can_trust)).await
+        }
+    }
 }
 
 /// Run the package-manager command in an already-booted guest and gather the
@@ -259,7 +288,11 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
 
     // The actual command, fully interactive on the host terminal.
     eprintln!("{} {command_line}\n", ">> running:".dimmed());
-    let guest_cmd = format!("cd /workspace && exec {}", quote_args(args));
+    let guest_cmd = format!(
+        "{}; cd /workspace && exec {}",
+        scripts::RAISE_FDS,
+        quote_args(args)
+    );
     let exit_code = sb
         .attach_with("bash", |a| a.args(["-lc", &guest_cmd]))
         .await?;
@@ -367,17 +400,21 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     })
 }
 
-/// Read-only review of a finished run, then copy back on approval.
+/// Review of a finished enforced run. Copies back on approval, aborts on quit,
+/// or — when the user marked blocked hosts and confirmed — saves them to the
+/// allowlist and signals a clean re-run.
 async fn finish_review(
     sb: &Sandbox,
-    project_dir: &Path,
-    write_set: &WriteSet,
+    ctx: &RunCtx<'_>,
     mut run: CommandRun,
-) -> Result<()> {
+    allow: &[String],
+    can_trust: bool,
+) -> Result<AfterReview> {
     let outcome = review::run(Review {
         files: std::mem::take(&mut run.files),
-        network: net_rows(&run.network, false),
-        network_selectable: false,
+        network: net_rows(&run.network, |c| enforced_status(c, allow, can_trust)),
+        network_selectable: can_trust,
+        allow_rerun: can_trust,
         network_banner: run.network_banner.clone(),
         outside_banner: run.outside.banner(),
         outside_truncated: run.outside.truncated,
@@ -389,12 +426,22 @@ async fn finish_review(
     match outcome.decision {
         Decision::Abort => {
             eprintln!("{}", "aborted — nothing copied back".red());
-            Ok(())
+            Ok(AfterReview::Done)
         }
         Decision::Approve => {
-            copy_back(sb, project_dir, write_set, &run).await?;
+            copy_back(sb, ctx.project_dir, ctx.write_set, &run).await?;
             eprintln!("{}", "approved — results copied into the project".green());
-            Ok(())
+            Ok(AfterReview::Done)
+        }
+        Decision::Rerun => {
+            let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
+            eprintln!(
+                "{} {} host(s) → {}",
+                ">> allowed".dimmed(),
+                outcome.allow.len(),
+                allowlist::path(ctx.project_dir).display(),
+            );
+            Ok(AfterReview::Rerun(merged))
         }
     }
 }
@@ -432,25 +479,51 @@ async fn copy_back(
         .context("copy-back failed")
 }
 
-/// One review row per distinct host. In a learn run, unexpected named hosts are
-/// selectable (the user opts in to trust them); known registries and bare-IP
-/// contacts are not — registries are always allowed, and an IP with no resolved
-/// name is itself worth leaving blocked.
-fn net_rows(contacts: &[NetworkContact], learn: bool) -> Vec<NetRow> {
+/// One review row per distinct host, classified by `classify` into a status and
+/// whether it can be selected. Bare-IP contacts are never selectable — there's no
+/// name to write to the allowlist.
+fn net_rows(
+    contacts: &[NetworkContact],
+    classify: impl Fn(&NetworkContact) -> (NetStatus, bool),
+) -> Vec<NetRow> {
     let mut seen = BTreeSet::new();
     let mut rows = Vec::new();
     for c in contacts {
         if !seen.insert(c.host().to_string()) {
             continue;
         }
-        let selectable = learn && !c.known && c.domain.is_some();
+        let (status, selectable) = classify(c);
         rows.push(NetRow {
             contact: c.clone(),
+            status,
             selectable,
             selected: false,
         });
     }
     rows
+}
+
+/// Learn run: registries are known; every other contact was merely observed and —
+/// if it resolved to a domain — can be trusted for future enforcement.
+fn learn_status(c: &NetworkContact) -> (NetStatus, bool) {
+    if c.known {
+        (NetStatus::Known, false)
+    } else {
+        (NetStatus::Observed, c.domain.is_some())
+    }
+}
+
+/// Enforced run: known registries and allowlisted hosts are reachable; everything
+/// else was blocked, and a blocked named host can be selected to allow on a clean
+/// re-run (never under `--strict`, where the allowlist is ignored).
+fn enforced_status(c: &NetworkContact, allow: &[String], can_trust: bool) -> (NetStatus, bool) {
+    if c.known {
+        (NetStatus::Known, false)
+    } else if contact_allowed(c, allow) {
+        (NetStatus::Allowed, false)
+    } else {
+        (NetStatus::Blocked, can_trust && c.domain.is_some())
+    }
 }
 
 /// Distinct hosts the command contacted that the enforced policy (registries +
@@ -667,4 +740,49 @@ fn entry_rule(entry: &str) -> Option<Rule> {
         ports: vec![PortRange::single(443), PortRange::single(80)],
         action: Action::Allow,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contact(domain: Option<&str>, known: bool) -> NetworkContact {
+        NetworkContact {
+            domain: domain.map(str::to_string),
+            ip: "1.2.3.4".to_string(),
+            port: 443,
+            known,
+        }
+    }
+
+    #[test]
+    fn enforced_status_marks_only_blocked_named_hosts_selectable() {
+        let allow = vec!["example.com".to_string()];
+
+        // Registry: reachable, not selectable.
+        assert_eq!(
+            enforced_status(&contact(Some("packagist.org"), true), &allow, true),
+            (NetStatus::Known, false)
+        );
+        // Covered by the allowlist (subdomain): reachable, not selectable.
+        assert_eq!(
+            enforced_status(&contact(Some("api.example.com"), false), &allow, true),
+            (NetStatus::Allowed, false)
+        );
+        // Blocked named host: selectable when trust is permitted.
+        assert_eq!(
+            enforced_status(&contact(Some("evil.test"), false), &allow, true),
+            (NetStatus::Blocked, true)
+        );
+        // Same host under --strict: shown blocked, but not selectable.
+        assert_eq!(
+            enforced_status(&contact(Some("evil.test"), false), &allow, false),
+            (NetStatus::Blocked, false)
+        );
+        // Bare IP: blocked, never selectable — nothing to add to the allowlist.
+        assert_eq!(
+            enforced_status(&contact(None, false), &allow, true),
+            (NetStatus::Blocked, false)
+        );
+    }
 }

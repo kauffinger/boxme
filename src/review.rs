@@ -3,7 +3,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::netcap::NetworkContact;
@@ -41,11 +41,27 @@ impl FileItem {
     }
 }
 
-/// One network row in the review. In a learn run the unexpected, named hosts are
-/// `selectable` and toggling `selected` adds them to the allowlist.
+/// How a contacted host stands relative to the current network policy. Drives
+/// the colour and label in the Network tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetStatus {
+    /// Built-in package registry — always reachable.
+    Known,
+    /// Reachable because the project allowlist permits it (enforced run).
+    Allowed,
+    /// Learn run: contacted with the network open, not yet trusted.
+    Observed,
+    /// Enforced run: denied by the policy.
+    Blocked,
+}
+
+/// One network row in the review. A `selectable` row can be toggled with Space:
+/// in a learn run that trusts an observed host; in an enforced run it marks a
+/// blocked host to allow on a clean re-run.
 #[derive(Debug, Clone)]
 pub struct NetRow {
     pub contact: NetworkContact,
+    pub status: NetStatus,
     pub selectable: bool,
     pub selected: bool,
 }
@@ -54,6 +70,8 @@ pub struct NetRow {
 pub enum Decision {
     Approve,
     Abort,
+    /// Allow the marked blocked hosts and re-run under enforcement.
+    Rerun,
 }
 
 /// What the review returns: the decision plus, for a learn run, the hosts the
@@ -75,6 +93,8 @@ pub struct Review {
     pub network: Vec<NetRow>,
     /// Learn run: the Network tab shows checkboxes and `Space` trusts a host.
     pub network_selectable: bool,
+    /// Enforced run: blocked hosts can be marked and `r` allows them + re-runs.
+    pub allow_rerun: bool,
     /// Banner instead of contacts when the capture was unavailable/unreadable.
     pub network_banner: Option<String>,
     /// Paths the command wrote outside /workspace — a supply-chain signal.
@@ -102,6 +122,8 @@ struct App {
     diff_lines: u16,
     /// `c` toggles this to expand a truncated command to its full wrapped form.
     show_full_command: bool,
+    /// When set, the allow-and-re-run confirmation popup is shown.
+    confirming: bool,
 }
 
 /// Full-screen review; returns the user's decision (and trusted hosts). The
@@ -119,6 +141,7 @@ pub fn run(review: Review) -> Result<Outcome> {
         page_height: 0,
         diff_lines: 0,
         show_full_command: false,
+        confirming: false,
     };
     if !app.review.files.is_empty() {
         app.file_state.select(Some(0));
@@ -137,15 +160,15 @@ pub fn run(review: Review) -> Result<Outcome> {
     ratatui::restore();
     let decision = decision?;
 
-    let allow = if decision == Decision::Approve {
-        app.review
+    let allow = match decision {
+        Decision::Approve | Decision::Rerun => app
+            .review
             .network
             .iter()
             .filter(|r| r.selectable && r.selected)
             .filter_map(|r| r.contact.domain.clone())
-            .collect()
-    } else {
-        Vec::new()
+            .collect(),
+        Decision::Abort => Vec::new(),
     };
 
     Ok(Outcome { decision, allow })
@@ -164,12 +187,24 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        // While the confirmation popup is up, only the y/n answer matters.
+        if app.confirming {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(Decision::Rerun),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {
+                    app.confirming = false
+                }
+                _ => {}
+            }
+            continue;
+        }
         // Esc is deliberately unbound: vim users press it reflexively, and a
         // single keystroke must not abort a run that took minutes to produce.
         match (key.code, key.modifiers) {
             (KeyCode::Char('a'), KeyModifiers::NONE) => return Ok(Decision::Approve),
             (KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(Decision::Abort),
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(Decision::Abort),
+            (KeyCode::Char('r'), KeyModifiers::NONE) if app.can_rerun() => app.confirming = true,
             (KeyCode::Tab, _)
             | (KeyCode::BackTab, _)
             | (KeyCode::Char('h'), KeyModifiers::NONE)
@@ -258,6 +293,17 @@ impl App {
         i32::from(self.page_height.max(1))
     }
 
+    /// Whether `r` can open the confirmation popup: an enforced run with at least
+    /// one blocked host marked.
+    fn can_rerun(&self) -> bool {
+        self.review.allow_rerun
+            && self
+                .review
+                .network
+                .iter()
+                .any(|r| r.selectable && r.selected)
+    }
+
     fn toggle_net(&mut self) {
         if !self.review.network_selectable {
             return;
@@ -297,6 +343,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         Tab::Files => {
             " ↑↓/jk select   g/G first/last   ^d/^u scroll diff   h/l tab   c cmd   a approve   q abort "
         }
+        Tab::Network if app.review.allow_rerun => {
+            " ↑↓/jk select   Space mark blocked   r allow+rerun   h/l tab   a approve   q abort "
+        }
         Tab::Network if app.review.network_selectable => {
             " ↑↓/jk select   Space trust host   h/l tab   c cmd   a approve   q abort "
         }
@@ -308,6 +357,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
+
+    if app.confirming {
+        draw_confirm(f, app);
+    }
 }
 
 /// The run status + tabs, always shown. Built separately from the command so
@@ -318,7 +371,7 @@ fn status_spans(app: &App) -> Vec<Span<'static>> {
         .review
         .network
         .iter()
-        .filter(|r| !r.contact.known)
+        .filter(|r| matches!(r.status, NetStatus::Blocked | NetStatus::Observed))
         .count();
     let outside_count = app.review.outside.len();
 
@@ -557,7 +610,7 @@ fn draw_network(f: &mut Frame, app: &mut App, area: Rect) {
                 Some(domain) => format!("{domain} ({}) :{}", c.ip, c.port),
                 None => format!("{} :{}", c.ip, c.port),
             };
-            // Checkbox only for selectable rows in learn mode; everything else
+            // Checkbox only when the run permits marking hosts; everything else
             // keeps a 4-space gutter so the columns line up.
             let check = if !selectable {
                 ""
@@ -568,18 +621,28 @@ fn draw_network(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "[ ] "
             };
-            let (tag, style) = if c.known {
-                ("known      ", Style::default().fg(Color::Green))
-            } else if selectable && row.selected {
-                ("trusted    ", Style::default().fg(Color::Green))
-            } else {
-                ("unexpected ", Style::default().fg(Color::Yellow))
+            let (tag, style) = match row.status {
+                NetStatus::Known => ("known      ", Style::default().fg(Color::Green)),
+                NetStatus::Allowed => ("allowed    ", Style::default().fg(Color::Green)),
+                NetStatus::Observed if row.selected => {
+                    ("trusted    ", Style::default().fg(Color::Green))
+                }
+                NetStatus::Observed => ("unexpected ", Style::default().fg(Color::Yellow)),
+                NetStatus::Blocked if row.selected => {
+                    ("allow      ", Style::default().fg(Color::Green))
+                }
+                NetStatus::Blocked => ("blocked    ", Style::default().fg(Color::Yellow)),
             };
             ListItem::new(format!("{check}{tag}{label}")).style(style)
         })
         .collect();
 
-    let title = if selectable {
+    let title = if app.review.allow_rerun {
+        format!(
+            " network contacts ({}) — Space marks a blocked host, r allows + re-runs ",
+            app.review.network.len()
+        )
+    } else if selectable {
         format!(
             " network contacts ({}) — Space trusts an unexpected host ",
             app.review.network.len()
@@ -639,6 +702,68 @@ fn draw_outside(f: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, &mut app.out_state);
+}
+
+/// The allow-and-re-run confirmation, drawn over the review. Lists exactly which
+/// blocked hosts will be written to `.boxme/allow` before the clean re-run.
+fn draw_confirm(f: &mut Frame, app: &App) {
+    let hosts: Vec<&str> = app
+        .review
+        .network
+        .iter()
+        .filter(|r| r.selectable && r.selected)
+        .map(|r| r.contact.host())
+        .collect();
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "Allow {} host(s) and re-run under enforcement?",
+                hosts.len()
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for host in &hosts {
+        lines.push(Line::from(Span::styled(
+            format!("  {host}"),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[y]", Style::default().fg(Color::Green)),
+        Span::raw(" allow + re-run    "),
+        Span::styled("[n]", Style::default().fg(Color::Red)),
+        Span::raw(" cancel"),
+    ]));
+
+    let area = centered(f.area(), 64, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" confirm "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// A `width`×`height` rectangle centered in `area`, clamped to fit.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }
 
 /// Compact byte size for the Outside list (e.g. `12.3 KB`).

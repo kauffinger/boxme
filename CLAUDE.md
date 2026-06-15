@@ -49,8 +49,12 @@ command.
 `run.rs` is the orchestrator and the file to read first. It validates the tool
 is `composer`/`npm`, detects versions, then chooses one of two paths:
 
-- **`enforced_run`** — single pass under a fixed `NetworkPolicy`: boot, run,
-  read-only review, copy back on approval.
+- **`enforced_run`** — deny-by-default pass: boot under the allowlist, run,
+  review, copy back on approval. If the user marks blocked hosts and confirms,
+  it appends them to `.boxme/allow` and re-runs itself clean under the updated
+  policy (recursively, discarding the throwaway VM) — so a newly-needed host can
+  be allowed straight from the review without `--learn` or hand-editing. Under
+  `--strict` this affordance is off (the allowlist is ignored anyway).
 - **`learn_run`** — runs when `--learn` is passed or a project has no
   `.boxme/allow` yet. Observes the command with the network open, lets the user
   trust contacted hosts in the review, saves them to `.boxme/allow`, then either
@@ -87,7 +91,8 @@ tag a guest git baseline → switch PHP/Node versions → snapshot the file mani
 - `allowlist.rs` — the `.boxme/allow` per-project file (load/merge/save, entry
   matching).
 - `review.rs` — the ratatui TUI (Files / Network / Outside tabs, inline diffs,
-  host selection in learn mode). Returns a `Decision` plus the chosen hosts.
+  host selection in learn and enforce runs, the allow-and-re-run confirmation).
+  Returns a `Decision` (approve / abort / re-run) plus the chosen hosts.
 - `copyback.rs` — on approval, tars the approved paths out of the guest and
   unpacks them into the project, rejecting absolute/`..` paths and applying
   deletions only within the project dir.

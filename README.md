@@ -81,10 +81,15 @@ blocked. On approve, your picks are saved to `.boxme/allow` and:
   under deny-by-default (DNS + registries + your allowlist) and *that* clean
   result is what you review and copy back.
 
-**Every later run** in that project enforces `.boxme/allow` automatically. Add
-`--learn` to re-open the picker when a new dependency needs a new host, or just
-edit the file. `--strict` ignores the allowlist and permits only the registries
-(the tightest setting).
+**Every later run** in that project enforces `.boxme/allow` automatically. When a
+new dependency contacts a host the allowlist doesn't cover, that host shows up
+**blocked** in the review's Network tab — mark it with `Space`, press `r`, and
+confirm: boxme appends it to `.boxme/allow` and re-runs the command clean under
+the updated policy, so the result you review actually had the host available. You
+can still pass `--learn` to re-open the full host picker, or edit the file by
+hand. `--strict` ignores the allowlist and permits only the registries (the
+tightest setting) — there blocked hosts are shown for reference but can't be
+allowed inline.
 
 `.boxme/allow` is one entry per line — commit it to share the decision with your
 team:
@@ -97,7 +102,7 @@ example.com         # the domain and every subdomain
 
 Real-time "allow this connection? [y/n]" prompting mid-run isn't offered: the
 sandbox's network policy is fixed when the VM boots, so trust is decided in the
-review between runs, not during one. Path-level rules (e.g. `github.com/org/*`)
+review (and applied on a clean re-run), not during a run. Path-level rules (e.g. `github.com/org/*`)
 aren't possible either — the URL path lives inside TLS, so the policy only ever
 sees the hostname.
 
@@ -106,7 +111,8 @@ sees the hostname.
 `↑↓`/`jk` select · `g`/`G` first/last · `h`/`l`/`Tab` switch Files/Network/Outside
 (`1`/`2`/`3` jump directly) · `Ctrl-d`/`Ctrl-u` half-page scroll ·
 `Ctrl-f`/`Ctrl-b`/`PgUp`/`PgDn` full-page scroll · `J`/`K` line scroll ·
-`c` expand a truncated command · `Space` trust host (observe run) ·
+`c` expand a truncated command · `Space` trust host (observe run) /
+mark a blocked host (enforce run) · `r` allow marked hosts + re-run (enforce run) ·
 `a` approve · `q`/`Ctrl-C` abort
 
 A long command line is truncated with `…` in the header so the tabs stay visible;
