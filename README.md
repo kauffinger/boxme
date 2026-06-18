@@ -85,6 +85,12 @@ boxme --memory 4096 --cpus 4 composer update
 # file review is unaffected:
 boxme --without-git composer install     # -G: skip the .git directory
 boxme --without-media npm ci             # -M: skip images/video/audio/archives
+boxme --without-deps composer install    # -D: skip vendor/node_modules (fresh install)
+
+# By default the existing vendor/ and node_modules/ ARE copied in, so an
+# incremental command only does incremental work:
+boxme composer require vendor/package    # reuses the existing vendor/
+boxme npm install some-package           # reuses the existing node_modules/
 
 # Pass environment variables into the guest (private registries, auth):
 boxme -e COMPOSER_AUTH composer install      # copy host value
@@ -95,6 +101,68 @@ Anything you pass with `-e` is visible to the package code running in the
 sandbox — a malicious postinstall could read it and try to send it somewhere.
 The Network tab shows every destination contacted; `--strict` limits where
 anything can go.
+
+## Dev server
+
+`boxme dev` runs your whole dev stack *inside* the sandbox and forwards its ports
+back to your machine. The default command is `composer run dev` (Laravel's
+concurrently-driven `artisan serve` + queue + Vite), but anything works:
+
+```sh
+boxme dev                         # composer run dev, ports 8000 + 5173
+boxme dev npm run dev             # just Vite
+boxme dev -p 3000 -p 5173 npm run dev   # custom ports (HOST or HOST:GUEST)
+```
+
+### Attaching a second shell
+
+While a `boxme dev` session is running, open another terminal in the same folder
+and drop into the live VM — for migrations, tinker, a one-off build, or just
+poking around:
+
+```sh
+boxme attach                       # interactive shell in /workspace
+boxme attach php artisan migrate   # run one command and exit
+boxme attach php artisan tinker
+```
+
+`attach` finds the session by the folder (one dev VM per folder) and connects as
+a second shell alongside the running stack — it never tears the VM down. The
+database lives in the guest, so anything stateful (creating the sqlite file,
+running migrations) happens here, in the attached shell. Equivalently, chain it
+into the dev command itself:
+
+```sh
+boxme dev bash -lc 'php artisan migrate --force && composer run dev'
+```
+
+What it does: boots a writable guest, copies your project in, runs `composer
+install` / `npm install` **in the guest** (so dependencies get their Linux-native
+binaries — no platform mismatch), then runs your command and watches your project
+for edits. Every save is synced **one-way, host → guest**, so the dev server and
+Vite HMR see your changes live — but nothing the guest writes is ever copied back.
+Your machine stays read-only to the sandbox; the integrity guarantee holds.
+
+Because the install happens in the guest, this is also the cleanest way to develop
+a project whose native modules (esbuild, sharp, …) differ between your host and
+Linux — you never have to reconcile the two `node_modules`. Stop the dev server
+(Ctrl-C) and the sandbox is torn down.
+
+Files the guest owns aren't synced from the host: `node_modules`, `vendor`,
+`.git`, `storage`, `bootstrap/cache`, `public/build`, `public/hot`. A dev server
+often needs to reach a database or external API, so the network policy still
+applies — run `boxme <pm> install --learn` first if you want deny-by-default
+enforcement during the session (otherwise egress is open but recorded).
+
+> Servers that bind only `127.0.0.1` inside the guest (artisan serve, Vite by
+> default) are bridged onto the guest's interface automatically, so the forwarded
+> host ports reach them without any config.
+
+Running `boxme dev` in several repos at once works — each gets its own VM, named
+per folder. If a default host port (8000/5173) is already taken by another
+session, boxme bumps it to the next free one and prints what it chose
+(`host port 8000 busy → using 8001`); the app still serves its normal port inside
+its own VM.
 
 ## Deciding what the network can reach
 

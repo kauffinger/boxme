@@ -68,12 +68,14 @@ Note the deliberate version ceiling on `time` in `Cargo.toml`: `>=0.3.6,
 
 ## Architecture
 
-Entry point `main.rs` parses the CLI and dispatches to `setup::setup` or
-`run::run`. `cli.rs` uses clap derive; everything that isn't the `setup`
-subcommand falls into an `#[command(external_subcommand)] Run(Vec<String>)`,
-which is why `boxme composer i` works — global flags (`--strict`, `--learn`,
-`--keep`, `--memory`, `--cpus`, `--without-git`/`-G`, `--without-media`/`-M`,
-`-e`) must come *before* the package-manager command.
+Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
+`dev::dev`, `dev::attach`, or `run::run`. `cli.rs` uses clap derive; `setup`,
+`dev` and `attach` are named subcommands, and everything else falls into an
+`#[command(external_subcommand)] Run(Vec<String>)`, which is why `boxme composer
+i` works — global flags
+(`--strict`, `--learn`, `--keep`, `--memory`, `--cpus`, `--without-git`/`-G`,
+`--without-media`/`-M`, `--without-deps`/`-D`, `-e`) must come *before* the
+package-manager command.
 
 `run.rs` is the orchestrator and the file to read first. It validates the tool
 is `composer`/`npm`, detects versions, then chooses one of two paths:
@@ -95,6 +97,30 @@ is `composer`/`npm`, detects versions, then chooses one of two paths:
 tag a guest git baseline → switch PHP/Node versions → snapshot the file manifest
 → start tcpdump → run the command interactively via `attach_with` → stop capture
 → diff the manifest → scan for out-of-workspace writes → build the review rows.
+
+`dev.rs` is a separate path (`boxme dev [--port …] [command]`, default command
+`composer run dev`) for running a long-lived dev-server stack *inside* the guest
+instead of on the host — so native binaries never have to leave Linux. It boots a
+writable guest with the requested ports published, copies the project in (lighter
+`DEV_UNPACK`, no git baseline), switches versions, runs `composer install` /
+`npm install` *in the guest* (Linux-native, never retargeted or copied back),
+then runs the command attached while a host-side `notify` watcher does **one-way
+host→guest file sync**: every edit is pushed into the guest's real ext4 via the
+agent fs API (`sb.fs().copy_from_host`/`mkdir`/`remove`/`rename`/`symlink`), which
+fires native guest inotify so Vite/Laravel HMR works. The sync only ever flows
+host→guest — nothing the guest writes is copied back — so the integrity guarantee
+holds without any writable bind mount or `.boxme/write` config. The watcher and
+the attached command run concurrently via `tokio::select!` (both borrow `&sb`);
+when the dev server exits, the sync future is dropped and the VM torn down. The
+`is_excluded` list (node_modules, vendor, .git, storage, bootstrap/cache,
+public/build, public/hot, .boxme) is the sync-side inverse of a writable-path
+config: the guest owns those, so the host never pushes them. Ports are bridged
+guest-side (`scripts::port_bridge`, a tiny Node proxy on the guest's eth0 IP →
+`127.0.0.1`) so servers that bind only loopback — artisan serve, Vite by default —
+are still reachable through microsandbox's host→guest forward, which dials the
+guest IP. **Unvalidated against a live VM:** per-edit sync latency under real
+editing, that agentd writes fire guest inotify, and the port-bridge binding
+assumption; verify these on a real `boxme dev` run.
 
 ### Module responsibilities
 
@@ -136,11 +162,27 @@ tag a guest git baseline → switch PHP/Node versions → snapshot the file mani
 - `copyback.rs` — on approval, tars the approved paths out of the guest and
   unpacks them into the project, rejecting absolute/`..` paths and applying
   deletions only within the project dir.
-- `util.rs` — `tar_directory` (packs the project for copy-in; always skips
-  top-level `vendor/`/`node_modules/`, and a `CopyFilter` from `--without-git`/
-  `--without-media` additionally drops `.git` and media/binary assets to shrink
-  the transfer and guest disk use), shell quoting/slugify, `shell_capture`,
-  `stream_shell_stderr` (streams guest exec output to the host terminal).
+- `dev.rs` — the `boxme dev` path: boot a writable guest with ports forwarded,
+  copy in, install deps in-guest, run the dev stack attached, and one-way
+  host→guest file sync via a `notify` watcher + the agent fs API. Reuses
+  `run.rs`'s `pub(crate)` helpers (`resolve_env`, `ensure_cache_volumes`,
+  `cleanup`, `quote_args`, the policy builders). Never copies back. Also hosts
+  `boxme attach`: the dev VM is named deterministically per folder
+  (`dev_vm_name` = `boxme-dev-<slug>-<fnv-of-abs-path>`, *not* the random-nonce
+  `run::vm_name`), so `attach` recomputes the name, `Sandbox::get(name).connect()`s
+  to the live VM, and opens a second TTY (`attach_with`) without owning teardown.
+  One dev VM per folder is enforced: `dev` refuses to boot if one is already
+  `Running`. Host ports are preflighted (`resolve_free_ports`) by probing
+  `127.0.0.1` — a busy port bumps to the next free one (guest side untouched), so
+  parallel dev sessions across repos don't collide on 8000/5173.
+- `util.rs` — `tar_directory` (packs the project for copy-in; a `CopyFilter`
+  drops, per its flags, the top-level `vendor/`/`node_modules/`
+  (`--without-deps`, off by default — so an incremental command starts from the
+  existing install), `.git` (`--without-git`) and media/binary assets
+  (`--without-media`) to shrink the transfer and guest disk use. The `dev` path
+  always sets `without_deps` — it installs Linux-native in-guest and never
+  copies back), shell quoting/slugify, `shell_capture`, `stream_shell_stderr`
+  (streams guest exec output to the host terminal).
 
 ### Network policy & the observe/enforce model
 

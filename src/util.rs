@@ -112,14 +112,17 @@ pub async fn shell_capture(sb: &Sandbox, script: &str) -> Result<String> {
     Ok(output.stdout().unwrap_or_default())
 }
 
-/// What `tar_directory` leaves out of the project tarball, on top of the
-/// always-skipped top-level `vendor/`/`node_modules/`.
+/// What `tar_directory` leaves out of the project tarball.
 #[derive(Clone, Copy, Default)]
 pub struct CopyFilter {
     /// Skip the top-level `.git` directory (the guest rebuilds its baseline).
     pub without_git: bool,
     /// Skip image/video/audio/archive assets anywhere in the tree.
     pub without_media: bool,
+    /// Skip the top-level `vendor/`/`node_modules/`. Off by default so
+    /// incremental commands start from the existing install; the `dev` path
+    /// always sets it (it installs Linux-native in-guest and never copies back).
+    pub without_deps: bool,
 }
 
 /// What the copy filter dropped, for the run summary.
@@ -197,14 +200,15 @@ pub async fn tar_directory(dir: &Path, out_tgz: &Path, filter: CopyFilter) -> Re
         // into stray file copies whose relative `require()`s then break.
         builder.follow_symlinks(false);
         let mut stats = SkipStats::default();
-        // Skip top-level vendor/ and node_modules/ — they dominate the tarball
-        // and the guest install rebuilds them anyway. Top level only: a nested
-        // one (e.g. Laravel's `public/vendor`) is real content. `.git` is
+        // Top-level vendor/ and node_modules/ are copied in by default so an
+        // incremental command starts from the existing install; `--without-deps`
+        // drops them for a lighter full-install transfer. Top level only: a
+        // nested one (e.g. Laravel's `public/vendor`) is real content. `.git` is
         // top-level too, dropped only when asked.
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let name = entry.file_name();
-            if name == "vendor" || name == "node_modules" {
+            if filter.without_deps && (name == "vendor" || name == "node_modules") {
                 continue;
             }
             if filter.without_git && name == ".git" {

@@ -10,9 +10,9 @@ pub const DEFAULT_PHP_VERSION: &str = "8.4";
 /// Node major shipped by the node:24 base image — no `n install` needed for it.
 pub const BASE_NODE_MAJOR: u32 = 24;
 
-/// Base snapshot setup: PHP 8.3-8.5 (Sury) + Composer with the soak-time
-/// supply-chain plugin, npm with min-release-age, `n` for other Node majors,
-/// and tcpdump for in-guest network capture.
+/// Base snapshot setup: PHP 8.3-8.5 (Sury) + Composer with the composer-fix and
+/// soak-time supply-chain plugins, npm with min-release-age, `n` for other Node
+/// majors, and tcpdump for in-guest network capture.
 pub const BASE_SETUP: &str = r#"
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -37,6 +37,9 @@ php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer --q
 rm -f /tmp/composer-setup.php
 echo 'export COMPOSER_ALLOW_SUPERUSER=1' > /etc/profile.d/composer.sh
 export COMPOSER_ALLOW_SUPERUSER=1
+echo ">> installing composer-fix (updates packages flagged by composer audit)"
+composer global config allow-plugins.innobrain/composer-fix true
+composer global require innobrain/composer-fix --no-interaction
 echo ">> installing composer soak-time (supply-chain safety: blocks deps younger than 7 days)"
 composer global config allow-plugins.innobrain/soak-time true
 # The plugin can't observe its own dist download (it isn't loaded yet), so its
@@ -84,6 +87,65 @@ git tag -f boxme-baseline HEAD >/dev/null
 echo ">> repo unpacked, baseline tagged"
 "#;
 
+/// Extract the host tarball into /workspace for a `dev` session. Unlike
+/// `UNPACK`, no git baseline is tagged: a dev run never diffs or copies back, so
+/// the (potentially slow on a big repo) baseline commit is pure overhead.
+pub const DEV_UNPACK: &str = r#"
+set -e
+mkdir -p /workspace
+tar --no-same-owner -xzf /tmp/repo.tgz -C /workspace
+rm -f /tmp/repo.tgz
+echo ">> project unpacked into /workspace"
+"#;
+
+/// Install composer dependencies in the guest before the dev stack runs. The
+/// install happens *in the guest*, so it pulls the Linux-native artifacts the
+/// guest will actually run — no host-platform retargeting (the opposite of the
+/// copy-back `npm install` path). Dev dependencies are kept: `composer run dev`
+/// needs pail/sail/etc.
+pub const COMPOSER_INSTALL: &str = "cd /workspace && composer install --no-interaction";
+
+/// Install npm dependencies in the guest before the dev stack runs. Linux-native
+/// by design — node_modules stays in the guest and is executed there, never
+/// copied back to the host.
+pub const NPM_INSTALL: &str = "cd /workspace && npm install";
+
+/// Bridge each forwarded guest port onto the guest's external interface so a dev
+/// server that binds only `127.0.0.1` (artisan serve and Vite both do by
+/// default) is still reachable through microsandbox's host→guest port forward,
+/// which dials the guest's eth0 IP. The proxy binds `<eth0-ip>:PORT`, which does
+/// not collide with the app's `127.0.0.1:PORT`; if a server already binds
+/// `0.0.0.0:PORT` the proxy's bind fails harmlessly (`.on('error')`) since the
+/// port is reachable directly. Ports come from a host-parsed `u16` list, never
+/// guest input. Started in the background; they die with the VM.
+pub fn port_bridge(ports: &[u16]) -> String {
+    let mut script = String::from(
+        r#"cat > /tmp/boxme-proxy.js <<'PROXY'
+const net = require('net');
+const port = Number(process.argv[2]);
+const ip = process.argv[3];
+net.createServer((s) => {
+  const u = net.connect(port, '127.0.0.1');
+  s.pipe(u);
+  u.pipe(s);
+  const done = () => { s.destroy(); u.destroy(); };
+  s.on('error', done);
+  u.on('error', done);
+}).on('error', () => {}).listen(port, ip);
+PROXY
+GUEST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+if [ -n "$GUEST_IP" ]; then
+"#,
+    );
+    for p in ports {
+        script.push_str(&format!(
+            "  node /tmp/boxme-proxy.js {p} \"$GUEST_IP\" >/dev/null 2>&1 &\n"
+        ));
+    }
+    script.push_str("fi\n");
+    script
+}
+
 /// Switch the guest's `php` alternative to the requested version. The version
 /// is interpolated into shell, but it's validated against `PHP_VERSIONS` first.
 pub fn php_switch(version: &str) -> String {
@@ -121,6 +183,25 @@ echo ">> using node $(node -v)"
 /// too (a bare `ulimit -n` sets both); the fallback covers a lower kernel cap on
 /// `fs.nr_open`, and `|| true` keeps a refusal from aborting the command.
 pub const RAISE_FDS: &str = "ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true";
+
+/// Raise the inotify watch ceiling before a `dev` stack starts. Vite/chokidar
+/// recursively watch /workspace (vendor/ and node_modules/ included), and the
+/// Linux default `fs.inotify.max_user_watches` (8192) is far too low for a real
+/// Laravel + node tree — Vite aborts with `ENOSPC: System limit for number of
+/// file watchers reached`. The guest is root, so it can raise the sysctls; `||
+/// true` keeps a refusal (e.g. a read-only /proc/sys) from aborting the run.
+pub const RAISE_INOTIFY: &str = "sysctl -w fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=1024 >/dev/null 2>&1 || true";
+
+/// Point npm's optional-dependency resolver at the host platform instead of the
+/// Linux guest it actually runs in. npm only installs the platform-gated
+/// optional deps (`@esbuild/*`, `@rollup/rollup-*`, `lightningcss`, `@swc/core`,
+/// `sharp`'s prebuilds, …) whose `os`/`cpu` match where npm runs — so a guest
+/// install drops the macOS binaries the host will try to load. `os`/`cpu` come
+/// from a fixed host-side whitelist (`darwin` + `arm64`/`x64`), never guest
+/// input, so they need no quoting.
+pub fn npm_platform_env(os: &str, cpu: &str) -> String {
+    format!("export npm_config_os={os} npm_config_cpu={cpu}; ")
+}
 
 /// File manifest of /workspace: every entry's size/type/path, then an md5 of
 /// every regular file (content hashing kills mtime noise). vendor/,

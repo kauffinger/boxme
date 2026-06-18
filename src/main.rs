@@ -2,6 +2,7 @@ mod allowlist;
 mod cli;
 mod copyback;
 mod detect;
+mod dev;
 mod manifest;
 mod netcap;
 mod outside;
@@ -19,6 +20,8 @@ async fn main() {
     let parsed = cli::Cli::parse();
     let result = match &parsed.command {
         cli::Command::Setup { force, disk } => setup::setup(*force, *disk).await,
+        cli::Command::Dev { port, cmd } => dev::dev(&parsed, cmd, port).await,
+        cli::Command::Attach { cmd } => dev::attach(cmd).await,
         cli::Command::Run(args) => run::run(&parsed, args).await,
     };
     if let Err(e) = result {

@@ -245,11 +245,15 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     let filter = CopyFilter {
         without_git: ctx.cli.without_git,
         without_media: ctx.cli.without_media,
+        without_deps: ctx.cli.without_deps,
     };
     let tarball = std::env::temp_dir().join(format!("boxme-{}.tgz", std::process::id()));
     let skipped = tar_directory(project_dir, &tarball, filter).await?;
     if filter.without_git {
         eprintln!("{}", ">> skipped .git".dimmed());
+    }
+    if filter.without_deps {
+        eprintln!("{}", ">> skipped vendor/node_modules".dimmed());
     }
     if skipped.files > 0 {
         eprintln!(
@@ -309,8 +313,9 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
 
     // The actual command, fully interactive on the host terminal.
     eprintln!("{} {command_line}\n", ">> running:".dimmed());
+    let npm_env = npm_platform_export(tool, &ctx.env);
     let guest_cmd = format!(
-        "{}; cd /workspace && exec {}",
+        "{}; {npm_env}cd /workspace && exec {}",
         scripts::RAISE_FDS,
         quote_args(args)
     );
@@ -595,17 +600,54 @@ async fn fetch_diff(sb: &Sandbox, path: &str, change: &Change) -> Option<String>
 }
 
 /// The user's command tokens, re-quoted for the guest shell.
-fn quote_args(args: &[String]) -> String {
+pub(crate) fn quote_args(args: &[String]) -> String {
     args.iter()
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// A guest-shell `export` that makes a Linux-guest `npm install` resolve the
+/// *host's* platform-gated native deps, so the copied-back `node_modules` has
+/// the macOS prebuilt binaries (esbuild, rollup, lightningcss, swc, sharp, …)
+/// the host will load — empty if not npm, the host isn't macOS, or the user
+/// already pinned `npm_config_os` via `-e` (their value wins). Prints a note so
+/// the run is honest about retargeting the install.
+fn npm_platform_export(tool: &str, env: &[(String, String)]) -> String {
+    if tool != "npm" || env.iter().any(|(k, _)| k == "npm_config_os") {
+        return String::new();
+    }
+    match host_npm_target() {
+        Some((os, cpu)) => {
+            eprintln!(
+                "{} resolving {os}/{cpu} native deps for the host",
+                ">> npm:".dimmed()
+            );
+            scripts::npm_platform_env(os, cpu)
+        }
+        None => String::new(),
+    }
+}
+
+/// The host's npm `os`/`cpu` target. `None` on non-macOS hosts — there the guest
+/// platform already matches what the result runs on — or on an arch npm has no
+/// name for.
+fn host_npm_target() -> Option<(&'static str, &'static str)> {
+    if std::env::consts::OS != "macos" {
+        return None;
+    }
+    let cpu = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        _ => return None,
+    };
+    Some(("darwin", cpu))
+}
+
 /// `-e KEY=VALUE` is taken verbatim; bare `-e KEY` copies the host value and
 /// errors if the host doesn't have it (a silent skip would surface later as a
 /// confusing auth failure in the guest).
-fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
+pub(crate) fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
     specs
         .iter()
         .map(|spec| match spec.split_once('=') {
@@ -649,7 +691,7 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
 }
 
 /// Tear down the run VM, honoring `--keep`.
-async fn cleanup(cli: &Cli, sb: Sandbox, name: &str) {
+pub(crate) async fn cleanup(cli: &Cli, sb: Sandbox, name: &str) {
     if cli.keep {
         eprintln!("{} VM kept running as '{name}'", ">> --keep:".dimmed());
         sb.detach().await;
@@ -677,7 +719,7 @@ async fn remove_vm(sb: Sandbox, name: &str, label: &str) {
 /// Named volumes must exist before a sandbox can mount them. Only the
 /// Node-version volume is mounted now (see `boot`); the composer/npm download
 /// caches stay guest-local to avoid the host's per-process file-descriptor cap.
-async fn ensure_cache_volumes() -> Result<()> {
+pub(crate) async fn ensure_cache_volumes() -> Result<()> {
     let existing = Volume::list().await?;
     let name = "boxme-node-versions";
     if !existing.iter().any(|v| v.name() == name) {
@@ -686,7 +728,7 @@ async fn ensure_cache_volumes() -> Result<()> {
     Ok(())
 }
 
-fn vm_name(project_dir: &Path) -> String {
+pub(crate) fn vm_name(project_dir: &Path) -> String {
     let slug = slugify(
         &project_dir
             .file_name()
@@ -707,7 +749,7 @@ fn vm_name(project_dir: &Path) -> String {
 /// SYN-based capture can't even see. Private/loopback/link-local/metadata stay
 /// denied by falling through to the default, as with microsandbox's own
 /// `public_only` default.
-fn observe_policy() -> NetworkPolicy {
+pub(crate) fn observe_policy() -> NetworkPolicy {
     NetworkPolicy {
         default_egress: Action::Deny,
         default_ingress: Action::Allow,
@@ -725,7 +767,7 @@ fn observe_policy() -> NetworkPolicy {
 }
 
 /// Deny-by-default egress: DNS plus the package registries over HTTP(S).
-fn strict_policy() -> NetworkPolicy {
+pub(crate) fn strict_policy() -> NetworkPolicy {
     let mut rules = vec![Rule::allow_dns()];
     for host in netcap::STRICT_DOMAINS {
         rules.push(entry_rule(host).expect("builtin strict domain parses"));
@@ -739,7 +781,7 @@ fn strict_policy() -> NetworkPolicy {
 
 /// Strict baseline plus the user's saved allowlist entries. Unparseable entries
 /// are skipped (they can only get there by hand-editing the file).
-fn enforced_policy(extra: &[String]) -> NetworkPolicy {
+pub(crate) fn enforced_policy(extra: &[String]) -> NetworkPolicy {
     let mut policy = strict_policy();
     for entry in extra {
         if let Some(rule) = entry_rule(entry) {
