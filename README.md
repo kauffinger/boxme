@@ -14,7 +14,8 @@ boxme npm i some-package
 What happens:
 
 1. A microVM boots from the `boxme-base` snapshot (PHP/Node versions matched to
-   your host, project tarred in, composer/npm caches on persistent volumes).
+   your host, your project mounted **read-only** with a throwaway writable layer
+   on top, composer/npm caches on persistent volumes).
 2. The command runs fully interactively — prompts and progress bars work.
 3. Inside the guest, tcpdump records every DNS lookup and outbound TCP SYN.
 4. A full-screen review shows:
@@ -80,15 +81,9 @@ boxme --learn composer install    # re-open the host picker to re-curate
 boxme --keep npm install          # keep the VM around afterwards
 boxme --memory 4096 --cpus 4 composer update
 
-# Copy less into the sandbox (faster, smaller guest disk use) — install
-# scripts don't read these. The guest rebuilds its own git baseline, so the
-# file review is unaffected:
-boxme --without-git composer install     # -G: skip the .git directory
-boxme --without-media npm ci             # -M: skip images/video/audio/archives
-boxme --without-deps composer install    # -D: skip vendor/node_modules (fresh install)
-
-# By default the existing vendor/ and node_modules/ ARE copied in, so an
-# incremental command only does incremental work:
+# The whole project is mounted read-only and the existing vendor/ and
+# node_modules/ stay visible, so an incremental command only does incremental
+# work (for a clean install, remove them on the host first, or use `npm ci`):
 boxme composer require vendor/package    # reuses the existing vendor/
 boxme npm install some-package           # reuses the existing node_modules/
 

@@ -73,9 +73,8 @@ Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
 `dev` and `attach` are named subcommands, and everything else falls into an
 `#[command(external_subcommand)] Run(Vec<String>)`, which is why `boxme composer
 i` works — global flags
-(`--strict`, `--learn`, `--keep`, `--memory`, `--cpus`, `--without-git`/`-G`,
-`--without-media`/`-M`, `--without-deps`/`-D`, `-e`) must come *before* the
-package-manager command.
+(`--strict`, `--learn`, `--keep`, `--memory`, `--cpus`, `-e`) must come *before*
+the package-manager command.
 
 `run.rs` is the orchestrator and the file to read first. It validates the tool
 is `composer`/`npm`, detects versions, then chooses one of two paths:
@@ -93,10 +92,29 @@ is `composer`/`npm`, detects versions, then chooses one of two paths:
   enforcement) or discards the observe VM and re-runs via `enforced_run` for a
   clean result.
 
-`run_command` is the shared core both paths call: tar the project in → unpack and
-tag a guest git baseline → switch PHP/Node versions → snapshot the file manifest
-→ start tcpdump → run the command interactively via `attach_with` → stop capture
-→ diff the manifest → scan for out-of-workspace writes → build the review rows.
+`run_command` is the shared core both paths call: mount the project read-only as
+an overlay lower + tag a guest git baseline (`scripts::UNPACK`, no tar copy-in) →
+switch PHP/Node versions → snapshot the file manifest → start tcpdump → run the
+command interactively via `attach_with` → stop capture → diff the manifest → scan
+for out-of-workspace writes → build the review rows.
+
+The project is **bind-mounted read-only** at `/ws-lower` (`boot`) and overlaid at
+`/workspace` with a guest-local writable upper, so nothing is copied in: reads
+fall through to the host tree via virtiofs, the command's writes land in the
+upper, and the host stays untouchable for the whole run (virtiofs rejects writes
+host-side, the guest kernel returns `EROFS`). The upper can't live on the guest
+root — that root is itself an overlayfs, which the kernel refuses as an upperdir
+(`not supported as upperdir`) — so `unpack` puts it on a sparse loop-mounted ext4
+sized to the guest root's free space (disk-backed, no RAM pressure unlike tmpfs).
+Because the host project is now the *live overlay lower*, copy-back is split in
+two (`copyback::stage` then `copyback::commit`): stage tars the changeset out
+while the VM is alive, the VM is torn down, then commit mutates the host tree —
+never while it's mounted. The whole project (including `.git`, `vendor`,
+`node_modules`) is always mounted; there is no opt-out, since hiding a dir from
+`/workspace` wouldn't hide it from in-guest code anyway — the full host tree is
+bind-mounted read-only at `/ws-lower`, readable regardless of any whiteout.
+Existing `vendor`/`node_modules` stay in place, so incremental commands do
+incremental work (`npm ci` clears `node_modules` itself for a clean install).
 
 `dev.rs` is a separate path (`boxme dev [--port …] [command]`, default command
 `composer run dev`) for running a long-lived dev-server stack *inside* the guest
@@ -159,11 +177,15 @@ assumption; verify these on a real `boxme dev` run.
 - `review.rs` — the ratatui TUI (Files / Network / Outside tabs, inline diffs,
   host selection in learn and enforce runs, the allow-and-re-run confirmation).
   Returns a `Decision` (approve / abort / re-run) plus the chosen hosts.
-- `copyback.rs` — on approval, tars the approved paths out of the guest and
-  unpacks them into the project, rejecting absolute/`..` paths and applying
-  deletions only within the project dir.
+- `copyback.rs` — on approval, applies the changeset in two phases so the host
+  tree is never mutated while it's a live overlay lower: `stage` tars the
+  approved paths out of the guest into a host-side tarball (VM alive, read-only),
+  then — after teardown — `commit` unpacks them into the project, rejecting
+  absolute/`..` paths and applying deletions only within the project dir.
 - `dev.rs` — the `boxme dev` path: boot a writable guest with ports forwarded,
-  copy in, install deps in-guest, run the dev stack attached, and one-way
+  copy in (this path still tars in via `tar_directory`, *not* the overlay — it
+  installs deps in-guest and needs a writable tree), install deps in-guest, run
+  the dev stack attached, and one-way
   host→guest file sync via a `notify` watcher + the agent fs API. Reuses
   `run.rs`'s `pub(crate)` helpers (`resolve_env`, `ensure_cache_volumes`,
   `cleanup`, `quote_args`, the policy builders). Never copies back. Also hosts
@@ -175,14 +197,11 @@ assumption; verify these on a real `boxme dev` run.
   `Running`. Host ports are preflighted (`resolve_free_ports`) by probing
   `127.0.0.1` — a busy port bumps to the next free one (guest side untouched), so
   parallel dev sessions across repos don't collide on 8000/5173.
-- `util.rs` — `tar_directory` (packs the project for copy-in; a `CopyFilter`
-  drops, per its flags, the top-level `vendor/`/`node_modules/`
-  (`--without-deps`, off by default — so an incremental command starts from the
-  existing install), `.git` (`--without-git`) and media/binary assets
-  (`--without-media`) to shrink the transfer and guest disk use. The `dev` path
-  always sets `without_deps` — it installs Linux-native in-guest and never
-  copies back), shell quoting/slugify, `shell_capture`, `stream_shell_stderr`
-  (streams guest exec output to the host terminal).
+- `util.rs` — `tar_directory` (packs a project tarball for the **`dev`** path
+  only — the review run mounts read-only instead; always skips the top-level
+  `vendor/`/`node_modules/`, which `dev` reinstalls Linux-native in-guest and
+  never copies back), shell quoting/slugify, `shell_capture`,
+  `stream_shell_stderr` (streams guest exec output to the host terminal).
 
 ### Network policy & the observe/enforce model
 
@@ -201,10 +220,15 @@ ignored. Commit it to share the decision with a team.
 
 ### Security boundaries to preserve when editing
 
-- The guest git baseline (`UNPACK` in `scripts.rs`) disables hooks via
+- The project is mounted **read-only** as the overlay lower (`boot` →
+  `m.bind(project_dir).readonly()`), so the command physically cannot write to
+  the host tree during the run — writes go to the guest-local upper, and the host
+  is only ever touched by `copyback::commit` *after* teardown, on approval.
+- The guest git baseline (`scripts::UNPACK`) disables hooks via
   `core.hooksPath=/dev/null` and `--no-verify` so committing the baseline can't
   run project code, and force-adds gitignored files so later modifications still
-  diff.
+  diff (excluding `vendor`/`node_modules`, which the review prunes — indexing
+  them would copy the whole dep tree up into the overlay for nothing).
 - The file manifest is NUL-delimited with the path last, so a guest-controlled
   filename containing tabs/newlines can't forge a review entry.
 - Copy-back treats the tarball as sandbox-controlled: it rejects absolute paths

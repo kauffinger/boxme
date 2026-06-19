@@ -16,11 +16,35 @@ pub struct CopyPlan {
     pub deletions: Vec<String>,
 }
 
-/// Tar the approved paths in the guest, pull the tarball, replace the expected
-/// dirs and unpack — then apply deletions. All target paths are confined to
-/// the project dir (tarball content is sandbox-controlled).
-pub async fn apply(sb: &Sandbox, project_dir: &Path, plan: &CopyPlan) -> Result<()> {
+/// The approved changeset, pulled out of the guest and waiting on the host to
+/// be applied to the project. Produced by [`stage`] while the VM is alive;
+/// consumed by [`commit`] after the VM (and its read-only bind of the project)
+/// is gone — the project is the live overlay lower during the run, so it must
+/// not be mutated until the mount is torn down.
+pub struct Staged {
+    /// Host path to the result tarball, or `None` if nothing was packed.
+    tgz: Option<PathBuf>,
+    /// Expected dirs to replace wholesale (only those that existed in the guest).
+    replace_dirs: Vec<String>,
+    /// Paths to delete on the host.
+    deletions: Vec<String>,
+}
+
+/// Tar the approved paths out of the guest into a host-side tarball. Only reads
+/// the guest `/workspace`; performs no host mutation, so it is safe to run while
+/// the VM still has the project bind-mounted read-only.
+pub async fn stage(sb: &Sandbox, project_dir: &Path, plan: &CopyPlan) -> Result<Staged> {
+    // Validate every host target up front so a bad path fails before we pull
+    // anything, not half-way through applying.
+    for dir in &plan.dirs {
+        safe_join(project_dir, dir)?;
+    }
+    for path in &plan.deletions {
+        safe_join(project_dir, path)?;
+    }
+
     let mut tar_paths: Vec<String> = Vec::new();
+    let mut replace_dirs: Vec<String> = Vec::new();
     for dir in &plan.dirs {
         let exists = shell_capture(
             sb,
@@ -31,11 +55,14 @@ pub async fn apply(sb: &Sandbox, project_dir: &Path, plan: &CopyPlan) -> Result<
             == "yes";
         if exists {
             tar_paths.push(dir.clone());
+            replace_dirs.push(dir.clone());
         }
     }
     tar_paths.extend(plan.files.iter().cloned());
 
-    if !tar_paths.is_empty() {
+    let tgz = if tar_paths.is_empty() {
+        None
+    } else {
         // Null-delimited path list via a file: immune to arg-length limits and
         // to any quoting in path names.
         let list = tar_paths.join("\0");
@@ -55,35 +82,82 @@ pub async fn apply(sb: &Sandbox, project_dir: &Path, plan: &CopyPlan) -> Result<
             .copy_to_host("/tmp/result.tgz", &host_tgz)
             .await
             .context("copying result tarball to host failed")?;
+        Some(host_tgz)
+    };
 
-        // Wholesale replace each expected dir the sandbox built fresh.
-        for dir in &plan.dirs {
-            if !tar_paths.iter().any(|p| p == dir) {
-                continue;
-            }
-            let target = safe_join(project_dir, dir)?;
-            if target.exists() {
-                std::fs::remove_dir_all(&target)
-                    .with_context(|| format!("removing {} failed", target.display()))?;
+    Ok(Staged {
+        tgz,
+        replace_dirs,
+        deletions: plan.deletions.clone(),
+    })
+}
+
+/// Apply a staged changeset to the project: replace the expected dirs wholesale,
+/// unpack the tarball, then apply deletions. Run only after the VM is gone, so
+/// the host tree is no longer a live overlay lower. All target paths are
+/// confined to the project dir (tarball content is sandbox-controlled).
+pub fn commit(project_dir: &Path, staged: Staged) -> Result<()> {
+    // Resolve the project dir once so containment checks compare canonical
+    // paths. Every destructive target below is confined to this.
+    let base = project_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {} failed", project_dir.display()))?;
+
+    if let Some(host_tgz) = &staged.tgz {
+        for dir in &staged.replace_dirs {
+            if let Some(target) = contained_target(&base, dir)? {
+                remove_contained(&target)?;
             }
         }
-
-        extract(&host_tgz, project_dir)?;
-        let _ = std::fs::remove_file(&host_tgz);
+        extract(host_tgz, &base)?;
+        let _ = std::fs::remove_file(host_tgz);
     }
 
-    for path in &plan.deletions {
-        let target = safe_join(project_dir, path)?;
-        match std::fs::symlink_metadata(&target) {
-            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&target)
-                .with_context(|| format!("deleting {} failed", target.display()))?,
-            Ok(_) => std::fs::remove_file(&target)
-                .with_context(|| format!("deleting {} failed", target.display()))?,
-            Err(_) => {}
+    for path in &staged.deletions {
+        if let Some(target) = contained_target(&base, path)? {
+            remove_contained(&target)?;
         }
     }
 
     Ok(())
+}
+
+/// Remove a target without following a final-component symlink: a symlink is
+/// unlinked itself (not its target), a real dir is removed recursively, a file
+/// is removed. A vanished target is a no-op.
+fn remove_contained(target: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(target) {
+        // symlink_metadata doesn't follow, so a symlink reports is_dir() == false
+        // and falls through to remove_file, unlinking the link, never its target.
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(target)
+            .with_context(|| format!("removing {} failed", target.display())),
+        Ok(_) => std::fs::remove_file(target)
+            .with_context(|| format!("removing {} failed", target.display())),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Resolve a sandbox-supplied relative path to an absolute target guaranteed to
+/// live inside `base` (which must already be canonical). On top of [`safe_join`]'s
+/// absolute/`..` rejection, this canonicalizes the target's *parent* — resolving
+/// any symlinked components — and refuses anything that lands outside `base`, so
+/// a deletion or wholesale-replace can't be redirected out of the project via a
+/// symlinked directory (the same guard `tar`'s `validate_inside_dst` applies on
+/// extract). `Ok(None)` means the target (or its parent) doesn't exist, so there
+/// is nothing to remove.
+fn contained_target(base: &Path, rel: &str) -> Result<Option<PathBuf>> {
+    let joined = safe_join(base, rel)?;
+    let (Some(parent), Some(name)) = (joined.parent(), joined.file_name()) else {
+        return Ok(None);
+    };
+    let canon_parent = match parent.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    if !canon_parent.starts_with(base) {
+        bail!("path escapes the project dir via a symlinked parent: {rel}");
+    }
+    Ok(Some(canon_parent.join(name)))
 }
 
 /// Unpack with explicit rejection of absolute paths and `..` components on top

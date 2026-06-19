@@ -19,10 +19,7 @@ use crate::outside::{self, OutsideScan};
 use crate::review::{self, Decision, FileItem, FileKind, NetRow, NetStatus, Review};
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
-use crate::util::{
-    human_bytes, shell_capture, shell_quote, slugify, stream_shell_stderr, tar_directory,
-    CopyFilter,
-};
+use crate::util::{shell_capture, shell_quote, slugify, stream_shell_stderr};
 
 /// Fetching a unified diff per unexpected file is one guest exec each — cap it.
 const MAX_DIFFS: usize = 100;
@@ -45,7 +42,11 @@ struct CommandRun {
 /// aborted), or the user allowed blocked host(s) and wants a clean re-run under
 /// the merged allowlist.
 enum AfterReview {
-    Done,
+    /// Review finished. `Some` carries an approved changeset to apply to the
+    /// project *after* the VM is torn down — the project is the live overlay
+    /// lower during the run, so it must not be mutated until the mount is gone.
+    /// `None` means abort or nothing to copy back.
+    Done(Option<copyback::Staged>),
     Rerun(Vec<String>),
 }
 
@@ -180,9 +181,11 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
     // observe run already is the clean result — copy it back without a re-run.
     let blocked = blocked_hosts(&run.network, &merged);
     if blocked.is_empty() {
-        let result = copy_back(&sb, ctx.project_dir, ctx.write_set, &run).await;
+        // Stage while the VM is alive, then tear it down before mutating the
+        // host project (it's the live overlay lower until the VM is gone).
+        let staged = stage_copy_back(&sb, ctx.project_dir, ctx.write_set, &run).await;
         cleanup(ctx.cli, sb, &name).await;
-        result?;
+        copyback::commit(ctx.project_dir, staged?)?;
         eprintln!("{}", "approved — results copied into the project".green());
         return Ok(());
     }
@@ -216,7 +219,15 @@ async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> 
     }
 
     match outcome? {
-        AfterReview::Done => Ok(()),
+        AfterReview::Done(staged) => {
+            // VM is down now, so the project is no longer a live overlay lower —
+            // safe to mutate the host tree.
+            if let Some(staged) = staged {
+                copyback::commit(ctx.project_dir, staged)?;
+                eprintln!("{}", "approved — results copied into the project".green());
+            }
+            Ok(())
+        }
         AfterReview::Rerun(merged) => {
             eprintln!(
                 "{}",
@@ -230,50 +241,16 @@ async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> 
 /// Run the package-manager command in an already-booted guest and gather the
 /// before/after manifest diff and network capture. Does not review or copy back.
 async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
-    let (tool, args, write_set, php, node, project_dir) = (
-        ctx.tool,
-        ctx.args,
-        ctx.write_set,
-        ctx.php,
-        ctx.node,
-        ctx.project_dir,
-    );
+    let (tool, args, write_set, php, node) = (ctx.tool, ctx.args, ctx.write_set, ctx.php, ctx.node);
     let command_line = args.join(" ");
 
-    // Unpack the project into /workspace and tag the guest baseline.
-    eprintln!("{}", ">> packing project...".dimmed());
-    let filter = CopyFilter {
-        without_git: ctx.cli.without_git,
-        without_media: ctx.cli.without_media,
-        without_deps: ctx.cli.without_deps,
-    };
-    let tarball = std::env::temp_dir().join(format!("boxme-{}.tgz", std::process::id()));
-    let skipped = tar_directory(project_dir, &tarball, filter).await?;
-    if filter.without_git {
-        eprintln!("{}", ">> skipped .git".dimmed());
-    }
-    if filter.without_deps {
-        eprintln!("{}", ">> skipped vendor/node_modules".dimmed());
-    }
-    if skipped.files > 0 {
-        eprintln!(
-            "{}",
-            format!(
-                ">> skipped {} media file(s), {}",
-                skipped.files,
-                human_bytes(skipped.bytes)
-            )
-            .dimmed()
-        );
-    }
-    sb.fs()
-        .copy_from_host(&tarball, "/tmp/repo.tgz")
-        .await
-        .context("copying project into the sandbox failed")?;
-    let _ = tokio::fs::remove_file(&tarball).await;
+    // Mount the project read-only as the overlay lower and tag the guest
+    // baseline. Nothing is copied in — reads fall through to the host tree via
+    // virtiofs, writes land in the guest-local overlay upper.
+    eprintln!("{}", ">> mounting project (overlay)...".dimmed());
     let code = stream_shell_stderr(sb, scripts::UNPACK).await?;
     if code != 0 {
-        bail!("unpacking the project in the guest failed (exit {code})");
+        bail!("mounting the project in the guest failed (exit {code})");
     }
 
     // Match host versions.
@@ -452,12 +429,13 @@ async fn finish_review(
     match outcome.decision {
         Decision::Abort => {
             eprintln!("{}", "aborted — nothing copied back".red());
-            Ok(AfterReview::Done)
+            Ok(AfterReview::Done(None))
         }
         Decision::Approve => {
-            copy_back(sb, ctx.project_dir, ctx.write_set, &run).await?;
-            eprintln!("{}", "approved — results copied into the project".green());
-            Ok(AfterReview::Done)
+            // Pull the changeset out while the VM is alive; the caller applies it
+            // to the host once the VM (and its read-only project bind) is gone.
+            let staged = stage_copy_back(sb, ctx.project_dir, ctx.write_set, &run).await?;
+            Ok(AfterReview::Done(Some(staged)))
         }
         Decision::Rerun => {
             let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
@@ -472,13 +450,15 @@ async fn finish_review(
     }
 }
 
-/// Copy the approved write-set out of the guest into the project.
-async fn copy_back(
+/// Pull the approved write-set out of the guest into a host-side tarball. Does
+/// not touch the project — the returned `Staged` is applied by `copyback::commit`
+/// after the VM is torn down.
+async fn stage_copy_back(
     sb: &Sandbox,
     project_dir: &Path,
     write_set: &WriteSet,
     run: &CommandRun,
-) -> Result<()> {
+) -> Result<copyback::Staged> {
     let plan = CopyPlan {
         dirs: write_set.dirs.iter().map(|d| d.to_string()).collect(),
         files: run
@@ -500,7 +480,7 @@ async fn copy_back(
             .map(|(p, _)| p.clone())
             .collect(),
     };
-    copyback::apply(sb, project_dir, &plan)
+    copyback::stage(sb, project_dir, &plan)
         .await
         .context("copy-back failed")
 }
@@ -593,7 +573,9 @@ async fn fetch_diff(sb: &Sandbox, path: &str, change: &Change) -> Option<String>
     let quoted = shell_quote(path);
     let script = match change {
         Change::Added => format!("cd /workspace && diff -u /dev/null {quoted} || true"),
-        _ => format!("cd /workspace && git diff boxme-baseline -- {quoted}"),
+        _ => format!(
+            "cd /workspace && GIT_DIR=/boxme-git GIT_WORK_TREE=/workspace git diff boxme-baseline -- {quoted}"
+        ),
     };
     let out = shell_capture(sb, &script).await.ok()?;
     (!out.trim().is_empty()).then_some(out)
@@ -676,12 +658,19 @@ pub(crate) fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
 /// `n install` every time would be slow.
 async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(Sandbox, String)> {
     eprintln!("{} '{name}' from {BASE_SNAPSHOT}...", ">> booting".dimmed());
+    // Bind the project in read-only as the overlay lower (see `scripts::UNPACK`).
+    // virtiofs rejects writes host-side and the guest kernel returns EROFS, so
+    // the host tree is untouchable for the whole run — the command's writes land
+    // in the guest-local overlay upper instead.
+    let project_dir =
+        std::fs::canonicalize(ctx.project_dir).unwrap_or_else(|_| ctx.project_dir.to_path_buf());
     let mut builder = Sandbox::builder(name.as_str())
         .from_snapshot(BASE_SNAPSHOT)
         .memory(ctx.cli.memory)
         .cpus(ctx.cli.cpus)
         .replace()
         .volume("/root/.n", |m| m.named("boxme-node-versions"))
+        .volume("/ws-lower", |m| m.bind(project_dir.clone()).readonly())
         .network(|n| n.policy(policy));
     for (key, value) in &ctx.env {
         builder = builder.env(key, value);

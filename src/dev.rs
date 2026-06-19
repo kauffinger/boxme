@@ -28,7 +28,7 @@ use crate::run::{
 };
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
-use crate::util::{human_bytes, slugify, stream_shell_stderr, tar_directory, CopyFilter};
+use crate::util::{slugify, stream_shell_stderr, tar_directory};
 
 /// Forwarded by default when no `--port` is given: artisan serve + Vite.
 const DEFAULT_PORTS: &[(u16, u16)] = &[(8000, 8000), (5173, 5173)];
@@ -80,7 +80,6 @@ pub async fn dev(cli: &Cli, cmd: &[String], port_specs: &[String]) -> Result<()>
 
     let session = dev_session(
         &sb,
-        cli,
         &project_dir,
         &command,
         &ports,
@@ -161,7 +160,6 @@ async fn boot_dev(
 #[allow(clippy::too_many_arguments)]
 async fn dev_session(
     sb: &Sandbox,
-    cli: &Cli,
     project_dir: &Path,
     command: &[String],
     ports: &[(u16, u16)],
@@ -174,24 +172,8 @@ async fn dev_session(
     //    guest installs them Linux-native and never copies back, so shipping the
     //    host's (macOS) build in would be wrong as well as wasteful.
     eprintln!("{}", ">> packing project...".dimmed());
-    let filter = CopyFilter {
-        without_git: cli.without_git,
-        without_media: cli.without_media,
-        without_deps: true,
-    };
     let tarball = std::env::temp_dir().join(format!("boxme-dev-{}.tgz", std::process::id()));
-    let skipped = tar_directory(project_dir, &tarball, filter).await?;
-    if skipped.files > 0 {
-        eprintln!(
-            "{}",
-            format!(
-                ">> skipped {} media file(s), {}",
-                skipped.files,
-                human_bytes(skipped.bytes)
-            )
-            .dimmed()
-        );
-    }
+    tar_directory(project_dir, &tarball).await?;
     sb.fs()
         .copy_from_host(&tarball, "/tmp/repo.tgz")
         .await

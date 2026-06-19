@@ -22,25 +22,6 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub keep: bool,
 
-    /// Don't copy the project's `.git` directory into the sandbox. The guest
-    /// rebuilds its own baseline from the working tree, so the diff is
-    /// unaffected — this just drops the (often large) history.
-    #[arg(long, short = 'G', global = true)]
-    pub without_git: bool,
-
-    /// Don't copy image/video/audio/archive assets into the sandbox.
-    /// composer/npm install scripts don't read them, and they often dominate a
-    /// large repo's size.
-    #[arg(long, short = 'M', global = true)]
-    pub without_media: bool,
-
-    /// Don't copy the existing `vendor/`/`node_modules/` into the sandbox; let
-    /// the guest install from scratch. Smaller transfer for a full install; the
-    /// default copies them in so incremental commands (`composer require`,
-    /// `npm install <pkg>`) only do incremental work.
-    #[arg(long, short = 'D', global = true)]
-    pub without_deps: bool,
-
     /// Guest memory in MiB.
     #[arg(long, global = true, default_value_t = 2048)]
     pub memory: u32,

@@ -62,29 +62,61 @@ echo "npm min-release-age: $(npm config get min-release-age --location=global) d
 echo ">> base image ready"
 "#;
 
-/// Extract the host tarball and tag a git baseline so changes can be diffed
-/// out later. Unlike microphp there is no reset-to-last-commit: the user's
-/// uncommitted state is exactly what the command should operate on.
+/// Mount the project (read-only bind at `/ws-lower`) as the lower layer of an
+/// overlay at `/workspace`, then tag a git baseline so changes can be diffed out
+/// later. Nothing is copied in: reads fall through to the host tree via
+/// virtiofs, writes land in the upper layer, and the host stays untouched. The
+/// user's uncommitted state is exactly what the command should operate on.
+///
+/// The upper/work dirs can't live on the guest root — that root is itself an
+/// overlayfs, which the kernel refuses as an overlay upperdir
+/// (`not supported as upperdir`). A sparse loop-mounted ext4, sized to the space
+/// free on the guest root, gives a disk-backed upper that overlay accepts with
+/// no RAM cost (unlike tmpfs, which a clean install would overrun).
+///
+/// The baseline is built in an **isolated git dir** (`GIT_DIR=/boxme-git`,
+/// work-tree `/workspace`), never the project's own `.git`. The host repo is
+/// mounted read-only as the overlay lower, so reusing its object store would
+/// make the in-guest `git add` read the host packfiles — which fails outright on
+/// a partial/corrupt/otherwise-unreadable pack (`not a GIT packfile`) and aborts
+/// the mount. A fresh store sidesteps that entirely: boxme only needs a snapshot
+/// of the working tree to diff against, not the user's history. `.git` is
+/// excluded from the add so git can't treat it as a submodule and resolve its
+/// HEAD out of that same unreadable store.
 ///
 /// `core.hooksPath=/dev/null` disables any hooks shipped in the project (incl.
 /// husky, which also drives them via core.hooksPath) so committing the baseline
 /// can't run project code; `--no-verify` is the belt-and-suspenders. `add -Af`
 /// forces .gitignore'd files (e.g. `.env`) into the baseline so that if package
-/// code later modifies one, `git diff` against the baseline still shows it — the
-/// baseline lives only in the guest and is never copied back.
+/// code later modifies one, `git diff` against the baseline still shows it.
+/// `vendor`/`node_modules` are excluded from the baseline: the file review
+/// prunes them anyway, and indexing them would copy the whole dep tree up into
+/// the overlay for nothing. The baseline lives only in the guest, never copied
+/// back.
 pub const UNPACK: &str = r#"
 set -e
-mkdir -p /workspace
-tar --no-same-owner -xzf /tmp/repo.tgz -C /workspace
-rm -f /tmp/repo.tgz
+if ! command -v mkfs.ext4 >/dev/null 2>&1; then
+  echo ">> mkfs.ext4 missing from the base image — rebuild with \`boxme setup --force\`" >&2
+  exit 1
+fi
+avail=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
+[ -z "$avail" ] && avail=32
+[ "$avail" -gt 4 ] && avail=$((avail - 2))
+truncate -s "${avail}G" /boxme-upper.img
+mkfs.ext4 -qF -O ^has_journal -E lazy_itable_init=1 -m 0 /boxme-upper.img
+mkdir -p /boxme-upper /workspace
+mount -o loop /boxme-upper.img /boxme-upper
+mkdir -p /boxme-upper/upper /boxme-upper/work
+mount -t overlay overlay -o lowerdir=/ws-lower,upperdir=/boxme-upper/upper,workdir=/boxme-upper/work /workspace
 cd /workspace
+export GIT_DIR=/boxme-git GIT_WORK_TREE=/workspace
 git config --global --add safe.directory /workspace
 git config --global core.hooksPath /dev/null
-if ! git rev-parse --git-dir >/dev/null 2>&1; then git init -q; fi
-git add -Af
+git init -q
+git add -Af -- . ':(exclude).git' ':(exclude)vendor' ':(exclude)node_modules'
 git -c user.email=boxme@local -c user.name=boxme commit --no-verify -qm "boxme baseline" || true
 git tag -f boxme-baseline HEAD >/dev/null
-echo ">> repo unpacked, baseline tagged"
+echo ">> project mounted (overlay), baseline tagged"
 "#;
 
 /// Extract the host tarball into /workspace for a `dev` session. Unlike
@@ -236,18 +268,26 @@ pub const BASELINE_MARKER: &str = "/root/.boxme-outside-baseline";
 /// mtime. ctime can't be backdated with `touch -t` from inside the guest, so
 /// this also catches chmod/chown/rename and binary replacement, not just writes.
 ///
-/// `-xdev` keeps the walk on the rootfs, which already skips the mounted cache
-/// volumes (/root/.composer/cache, /root/.npm, /root/.n) and the pseudo-fs. The
-/// explicit prunes drop /workspace (covered by the Files tab) plus the scratch
-/// and cache dirs composer/npm legitimately churn every run; trading a little
-/// blind spot in those for signal in the rest of the tree. Output is
-/// `size\ttype\tpath`; a missing marker prints `#NOMARKER`.
+/// `-xdev` keeps the walk on the rootfs, which already skips the separate-device
+/// mounts — the cache volumes (/root/.composer/cache, /root/.npm, /root/.n), the
+/// read-only project bind (/ws-lower), the overlay (/workspace) and its writable
+/// upper (the /boxme-upper loop mount) — plus the pseudo-fs. The explicit prunes
+/// drop /workspace (covered by the Files tab), the scratch and cache dirs
+/// composer/npm legitimately churn every run, `/boxme-upper.img` — the loop
+/// image backing the overlay upper, a plain rootfs file whose ctime bumps on
+/// every overlay write, so it would otherwise show up as a multi-GB outside
+/// write every run — and `/boxme-git`, the isolated baseline git dir (boxme's
+/// own machinery, written during the mount). Trading a little blind spot in
+/// those for signal in the rest of the tree. Output is `size\ttype\tpath`; a
+/// missing marker prints `#NOMARKER`.
 pub fn outside_scan() -> String {
     format!(
         r#"marker={BASELINE_MARKER}
 if [ ! -e "$marker" ]; then echo '#NOMARKER'; exit 0; fi
 find / -xdev -mindepth 1 \
-  \( -path /workspace -o -path /proc -o -path /sys -o -path /dev -o -path /run \
+  \( -path /workspace -o -path /boxme-upper -o -path /boxme-upper.img \
+     -o -path /boxme-git \
+     -o -path /proc -o -path /sys -o -path /dev -o -path /run \
      -o -path /tmp -o -path /var/tmp -o -path /var/log -o -path /var/cache \
      -o -path /var/lib/apt -o -path /root/.cache -o -path /root/.npm \
      -o -path /root/.composer -o -path /root/.n \) -prune -o \
