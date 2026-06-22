@@ -159,6 +159,89 @@ session, boxme bumps it to the next free one and prints what it chose
 (`host port 8000 busy → using 8001`); the app still serves its normal port inside
 its own VM.
 
+## Claude Code agent
+
+`boxme claude` runs Claude Code itself *inside* the sandbox, then copies exactly
+what it changed back into your working tree — as plain uncommitted edits you review
+with `git diff` and commit (or throw away) yourself.
+
+```sh
+boxme claude                        # interactive session; exit to copy out the result
+boxme claude 'fix the failing test' # one-shot headless run
+```
+
+The interactive session runs in **auto mode** (`--permission-mode auto`) — you're
+at the terminal, so its classifier can pause for your okay on a risky action. The
+headless run is unattended, so it runs with permission checks bypassed (auto mode
+would *abort* a headless run when its classifier blocks a legitimate step); the
+sandbox is the safety boundary, and you review the result before you keep it.
+
+The agent operates on your project mounted **read-only** with a throwaway writable
+layer on top, same as a package run — so it physically can't touch your machine
+during the session. When it exits, boxme diffs what it wrote, tears the VM down,
+and copies the changeset into your working tree:
+
+```sh
+git diff            # review what the agent changed
+git checkout .      # or throw it all away
+```
+
+No clean repo required — it works on a dirty tree, or even a directory that isn't
+a git repo at all.
+
+**If the agent changed a file you'd also edited locally**, copying out would
+overwrite your work, so boxme stops and asks: apply over your edits, put the
+agent's work on a `boxme/claude-<n>` branch instead (your edits left untouched), or
+abort. A headless run can't ask, so it takes the branch automatically:
+
+```sh
+git diff boxme/claude-1750000000~1 boxme/claude-1750000000   # review the branch
+git merge boxme/claude-1750000000                            # take it when ready
+```
+
+The branch is built in a throwaway git worktree at `HEAD`, so it's a faithful
+"HEAD + exactly what the agent did" — none of your uncommitted work is mixed in,
+and your working tree is never touched.
+
+### Authentication
+
+The agent needs a Claude credential, and there's **no browser login inside the
+box** (the sandbox only reaches Anthropic's API hosts, not the OAuth login flow),
+so boxme authenticates from a token. Generate a long-lived one on the host and
+save it to your keychain:
+
+```sh
+claude setup-token   # walks you through OAuth, prints a 1-year token
+boxme login          # paste it — stored in your keychain, never in a dotfile
+```
+
+`boxme login` keeps the token in the macOS Keychain (or a `0600` file under
+`~/.config/boxme` on Linux); `boxme claude` reads it at boot and injects it into
+the *guest* environment only — it never lands in your host shell. `boxme logout`
+removes it.
+
+boxme resolves the credential in order: an explicit `-e` flag, then your shell's
+`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`, then the saved token — so the normal
+path keeps the token out of your environment entirely. With none of these,
+`boxme claude` fails fast before booting and tells you to run `boxme login`. The
+token is the same exfil surface as any secret in the box — network enforcement is
+the mitigation: only Anthropic's own services (`anthropic.com` / `claude.com`, plus
+the package registries the agent may legitimately use) are reachable over TCP, so a
+leaked token can't be used against anything else.
+
+> A copied subscription login (the macOS Keychain blob Claude Code itself writes,
+> or Linux `~/.claude/.credentials.json`) is **not** reused: its access token
+> expires within hours and Claude Code's refresh flow doesn't work headless, so the
+> session would die mid-run. The `setup-token` token sidesteps that — no refresh,
+> valid for a year.
+
+The agent legitimately runs `composer`/`npm`, so it keeps the registry baseline on
+top of the API host. `boxme --learn claude '…'` observes with open egress and saves
+the hosts it contacted to `.boxme/claude-allow` (kept separate from the
+package-manager `.boxme/allow` so the two surfaces can't inherit each other's
+reachability); later runs enforce it. `--strict` drops the extras — API host and
+registries only.
+
 ## Deciding what the network can reach
 
 A run is one of two things: **observe** or **enforce**. UDP is always blocked

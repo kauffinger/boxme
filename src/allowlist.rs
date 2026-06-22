@@ -1,14 +1,47 @@
-//! Per-project network allowlist: domains the user has decided package code is
-//! allowed to reach. Stored as `.boxme/allow` in the project dir, one entry per
-//! line, `#` comments and blank lines ignored. Its presence flips a normal run
-//! from observe-by-default to deny-by-default (see `run::choose_policy`).
+//! Per-project network allowlists: domains the user has decided sandboxed code
+//! is allowed to reach. Two independent surfaces live side by side in `.boxme/`:
+//! `allow` for package-manager runs (composer/npm) and `claude-allow` for
+//! `boxme claude`. Keeping them separate means a `composer install` can't inherit
+//! reachability to the agent's hosts, and an agent run can't inherit a host a
+//! composer plugin once needed — each tool gets its own deny-by-default surface.
+//! One entry per line, `#` comments and blank lines ignored. For the package
+//! scope the file's mere presence flips a run from observe to deny-by-default
+//! (see `run::run`); the claude scope always enforces, so its file is purely
+//! additive extras.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-const HEADER: &str = "\
+/// Which allowlist file a call operates on. Package runs and `boxme claude` keep
+/// independent egress surfaces (see the module docs).
+#[derive(Clone, Copy)]
+pub enum Scope {
+    /// `.boxme/allow` — hosts composer/npm code may reach.
+    Packages,
+    /// `.boxme/claude-allow` — extra hosts Claude Code may reach, on top of the
+    /// always-allowed Anthropic API + package registries.
+    Claude,
+}
+
+impl Scope {
+    fn file_name(self) -> &'static str {
+        match self {
+            Scope::Packages => "allow",
+            Scope::Claude => "claude-allow",
+        }
+    }
+
+    fn header(self) -> &'static str {
+        match self {
+            Scope::Packages => PACKAGES_HEADER,
+            Scope::Claude => CLAUDE_HEADER,
+        }
+    }
+}
+
+const PACKAGES_HEADER: &str = "\
 # boxme network allowlist — hosts package code in this project may reach.
 # Deny-by-default is in effect whenever this file exists (alongside the package
 # registries, which are always allowed). One entry per line:
@@ -17,14 +50,24 @@ const HEADER: &str = "\
 # '#' comments and blank lines are ignored. Edit freely.
 ";
 
-pub fn path(project_dir: &Path) -> PathBuf {
-    project_dir.join(".boxme").join("allow")
+const CLAUDE_HEADER: &str = "\
+# boxme claude allowlist — extra hosts the agent may reach.
+# The Anthropic API and the package registries are always allowed; list here any
+# additional hosts the agent (or the commands it runs) needs — an internal API,
+# a docs site, a private registry, etc. One entry per line:
+#   example.com     a bare domain matches it and every subdomain
+#   =api.example.com  a '=' prefix matches that exact host only
+# '#' comments and blank lines are ignored. Edit freely.
+";
+
+pub fn path(project_dir: &Path, scope: Scope) -> PathBuf {
+    project_dir.join(".boxme").join(scope.file_name())
 }
 
-/// Whether the project has an allowlist file. Its mere existence flips a run to
-/// deny-by-default, even if it lists no extra hosts (registries only).
-pub fn exists(project_dir: &Path) -> bool {
-    path(project_dir).exists()
+/// Whether the project has the allowlist file for `scope`. For the package scope
+/// its mere existence flips a run to deny-by-default, even with no extra hosts.
+pub fn exists(project_dir: &Path, scope: Scope) -> bool {
+    path(project_dir, scope).exists()
 }
 
 /// Whether `host` is permitted by allowlist `entry`. A `=`-prefixed entry is an
@@ -41,32 +84,32 @@ pub fn entry_matches(entry: &str, host: &str) -> bool {
     }
 }
 
-/// Load the allowlist, returning a deduplicated, sorted list of entries. A
-/// missing file is simply an empty allowlist.
-pub fn load(project_dir: &Path) -> Vec<String> {
-    let raw = match std::fs::read_to_string(path(project_dir)) {
+/// Load the allowlist for `scope`, returning a deduplicated, sorted list of
+/// entries. A missing file is simply an empty allowlist.
+pub fn load(project_dir: &Path, scope: Scope) -> Vec<String> {
+    let raw = match std::fs::read_to_string(path(project_dir, scope)) {
         Ok(raw) => raw,
         Err(_) => return Vec::new(),
     };
     entries(raw.lines())
 }
 
-/// Merge `additions` into the existing allowlist and write it back, creating
-/// `.boxme/` if needed. Returns the merged list.
-pub fn save_merged(project_dir: &Path, additions: &[String]) -> Result<Vec<String>> {
+/// Merge `additions` into the existing allowlist for `scope` and write it back,
+/// creating `.boxme/` if needed. Returns the merged list.
+pub fn save_merged(project_dir: &Path, scope: Scope, additions: &[String]) -> Result<Vec<String>> {
     let merged = entries(
-        load(project_dir)
+        load(project_dir, scope)
             .iter()
             .map(String::as_str)
             .chain(additions.iter().map(String::as_str)),
     );
 
-    let file = path(project_dir);
+    let file = path(project_dir, scope);
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {} failed", parent.display()))?;
     }
-    let body = format!("{HEADER}{}\n", merged.join("\n"));
+    let body = format!("{}{}\n", scope.header(), merged.join("\n"));
     std::fs::write(&file, body).with_context(|| format!("writing {} failed", file.display()))?;
     Ok(merged)
 }
@@ -115,5 +158,15 @@ mod tests {
         assert!(entry_matches("=registry.npmjs.org", "registry.npmjs.org"));
         assert!(!entry_matches("=registry.npmjs.org", "npmjs.org"));
         assert!(!entry_matches("=registry.npmjs.org", "other.npmjs.org"));
+    }
+
+    #[test]
+    fn scopes_map_to_distinct_files() {
+        let dir = Path::new("/tmp/project");
+        assert_eq!(path(dir, Scope::Packages), dir.join(".boxme").join("allow"));
+        assert_eq!(
+            path(dir, Scope::Claude),
+            dir.join(".boxme").join("claude-allow")
+        );
     }
 }

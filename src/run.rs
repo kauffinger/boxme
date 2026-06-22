@@ -9,7 +9,7 @@ use microsandbox_network::policy::{
 };
 use owo_colors::OwoColorize;
 
-use crate::allowlist;
+use crate::allowlist::{self, Scope};
 use crate::cli::Cli;
 use crate::copyback::{self, CopyPlan};
 use crate::detect;
@@ -103,7 +103,7 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
     // A run learns (observe + pick) when asked to, or the first time a project
     // has no allowlist yet. Otherwise it enforces straight away: `--strict` is
     // registries-only, an existing allowlist is registries + its entries.
-    if cli.learn || (!cli.strict && !allowlist::exists(&project_dir)) {
+    if cli.learn || (!cli.strict && !allowlist::exists(&project_dir, Scope::Packages)) {
         learn_run(&ctx).await
     } else {
         // --strict ignores the allowlist (registries only) and disables the
@@ -111,7 +111,7 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
         let (allow, can_trust) = if cli.strict {
             (Vec::new(), false)
         } else {
-            (allowlist::load(&project_dir), true)
+            (allowlist::load(&project_dir, Scope::Packages), true)
         };
         enforced_run(&ctx, allow, can_trust).await
     }
@@ -149,7 +149,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         }
         // Persist the picks; this creates the file even with no extra hosts, so
         // future runs in this project enforce by default.
-        let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
+        let merged = allowlist::save_merged(ctx.project_dir, Scope::Packages, &outcome.allow)?;
         Ok::<_, anyhow::Error>(Some((run, merged)))
     }
     .await;
@@ -174,7 +174,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         "{} {} extra host(s) → {}",
         ">> learn: allowlist saved,".dimmed(),
         merged.len(),
-        allowlist::path(ctx.project_dir).display(),
+        allowlist::path(ctx.project_dir, Scope::Packages).display(),
     );
 
     // If everything the command contacted is allowed under enforcement, the
@@ -438,12 +438,12 @@ async fn finish_review(
             Ok(AfterReview::Done(Some(staged)))
         }
         Decision::Rerun => {
-            let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
+            let merged = allowlist::save_merged(ctx.project_dir, Scope::Packages, &outcome.allow)?;
             eprintln!(
                 "{} {} host(s) → {}",
                 ">> allowed".dimmed(),
                 outcome.allow.len(),
-                allowlist::path(ctx.project_dir).display(),
+                allowlist::path(ctx.project_dir, Scope::Packages).display(),
             );
             Ok(AfterReview::Rerun(merged))
         }
@@ -772,6 +772,26 @@ pub(crate) fn strict_policy() -> NetworkPolicy {
 /// are skipped (they can only get there by hand-editing the file).
 pub(crate) fn enforced_policy(extra: &[String]) -> NetworkPolicy {
     let mut policy = strict_policy();
+    for entry in extra {
+        if let Some(rule) = entry_rule(entry) {
+            policy.rules.push(rule);
+        }
+    }
+    policy
+}
+
+/// Deny-by-default egress for `boxme claude`: the strict baseline (DNS + package
+/// registries — the agent legitimately runs composer/npm itself), the Anthropic
+/// API, and the user's `.boxme/claude-allow` extras. Unlike the package path
+/// there is no observe-by-default: claude always enforces, and `--learn` swaps in
+/// `observe_policy` to discover hosts instead.
+pub(crate) fn claude_policy(extra: &[String]) -> NetworkPolicy {
+    let mut policy = strict_policy();
+    for host in netcap::CLAUDE_DOMAINS {
+        policy
+            .rules
+            .push(entry_rule(host).expect("builtin claude domain parses"));
+    }
     for entry in extra {
         if let Some(rule) = entry_rule(entry) {
             policy.rules.push(rule);

@@ -85,6 +85,30 @@ pub enum Command {
         cmd: Vec<String>,
     },
 
+    /// Run Claude Code inside the sandbox in full autonomy
+    /// (`--dangerously-skip-permissions`), then commit exactly what it changed
+    /// onto a fresh `boxme/claude-<n>` branch you can diff and merge. Give a prompt
+    /// for a one-shot headless run, or omit it for an interactive session:
+    /// `boxme claude` or `boxme claude 'fix the failing test'`.
+    Claude {
+        /// One-shot prompt (headless). Omit for an interactive session. Put it
+        /// after the global flags: `boxme --learn claude 'upgrade to PHP 8.4'`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "PROMPT"
+        )]
+        prompt: Vec<String>,
+    },
+
+    /// Save the Claude Code OAuth token (from `claude setup-token`) to your system
+    /// keychain so `boxme claude` can authenticate without a token in your shell
+    /// environment. Prompts for the token (echo off); pipe it in to script setup.
+    Login,
+
+    /// Remove the stored Claude token from your keychain.
+    Logout,
+
     /// Anything else is the package-manager command to run, e.g. `boxme composer i`.
     #[command(external_subcommand)]
     Run(Vec<String>),

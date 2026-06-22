@@ -1,5 +1,7 @@
 //! All shell run inside the guest, in one place.
 
+use crate::util::shell_quote;
+
 /// Versions of PHP installed side by side in the base snapshot. Keep in sync
 /// with the loop in `BASE_SETUP`.
 pub const PHP_VERSIONS: &[&str] = &["8.3", "8.4", "8.5"];
@@ -47,6 +49,8 @@ composer global config allow-plugins.innobrain/soak-time true
 composer global require innobrain/soak-time --prefer-source --no-interaction
 echo ">> upgrading npm (need >= 11.10.0 for min-release-age cooldown)"
 npm install -g npm@latest
+echo ">> installing Claude Code (@anthropic-ai/claude-code) for \`boxme claude\`"
+npm install -g @anthropic-ai/claude-code
 echo ">> enabling npm min-release-age (supply-chain safety: 7-day cooldown on new packages)"
 npm config set min-release-age 7 --location=global
 echo ">> installing n (Node version switcher; downloads land on the boxme-node-versions volume)"
@@ -59,6 +63,7 @@ echo "default: $(php -v | head -1)"
 composer --version
 echo "node $(node -v) / npm $(npm -v)"
 echo "npm min-release-age: $(npm config get min-release-age --location=global) day(s)"
+echo "claude $(claude --version 2>/dev/null || echo '(not installed)')"
 echo ">> base image ready"
 "#;
 
@@ -176,6 +181,75 @@ if [ -n "$GUEST_IP" ]; then
     }
     script.push_str("fi\n");
     script
+}
+
+/// First-run config seeded into the fresh guest before Claude Code launches.
+///
+/// A valid token authenticates the agent, but on a brand-new `/root/.claude.json`
+/// Claude Code still runs the first-run wizard (theme + login) and the per-project
+/// "trust this folder" dialog regardless of the token — which is what lands the
+/// user on a setup/login screen. These keys mark onboarding complete and
+/// `/workspace` trusted so the session opens straight to a usable prompt.
+/// `--dangerously-skip-permissions` notably does *not* suppress the trust dialog
+/// (upstream bug), hence the explicit project entry. `lastOnboardingVersion` is
+/// set to the guest's actual claude version so an onboarding-flow bump can still
+/// re-trigger it intentionally. The auto-mode opt-in keys pre-accept the prompt
+/// `--permission-mode auto` can show on first use (best-effort: harmless if the
+/// real keys differ). Written fresh each boot since the guest is throwaway.
+const CLAUDE_SEED: &str = r#"
+mkdir -p /root/.claude
+CLAUDE_VERSION="$(claude --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)"
+cat > /root/.claude.json <<EOF
+{
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "${CLAUDE_VERSION:-2.1.185}",
+  "theme": "dark",
+  "hasResetAutoModeOptInForDefaultOffer": true,
+  "autoPermissionsNotificationCount": 99,
+  "projects": {
+    "/workspace": {
+      "hasTrustDialogAccepted": true,
+      "hasTrustDialogHooksAccepted": true,
+      "hasCompletedProjectOnboarding": true
+    }
+  }
+}
+EOF
+cat > /root/.claude/settings.json <<EOF
+{
+  "skipDangerousModePermissionPrompt": true
+}
+EOF
+"#;
+
+/// Launch Claude Code inside the guest against the mounted `/workspace`.
+///
+/// Permission mode is chosen per path. An **interactive** session (no prompt) runs
+/// under `--permission-mode auto`: it's attached to the user's TTY, so auto mode's
+/// classifier is a safety net the user can answer, and it needs no root-bypass and
+/// shows no bypass-mode warning screen. A **headless** run (`-p`) is unattended, so
+/// it uses `--dangerously-skip-permissions` — auto mode would *abort* a headless
+/// session when its classifier blocks a legitimate action (a postinstall script, a
+/// git reset), and the sandbox is already the safety boundary. bypass refuses to
+/// run as root unless `IS_SANDBOX=1`, which auto mode tolerates but doesn't need.
+///
+/// `DISABLE_AUTOUPDATER` pins the baked claude version, and
+/// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` drops telemetry/error reporting.
+/// `CLAUDE_SEED` runs first so the agent skips onboarding and lands in a session.
+pub fn claude_run(prompt: Option<&str>) -> String {
+    let invocation = match prompt {
+        Some(p) => format!(
+            "claude --dangerously-skip-permissions -p {}",
+            shell_quote(p)
+        ),
+        None => "claude --permission-mode auto".to_string(),
+    };
+    format!(
+        "{RAISE_FDS}\n\
+         {CLAUDE_SEED}\n\
+         export IS_SANDBOX=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n\
+         cd /workspace && exec {invocation}"
+    )
 }
 
 /// Switch the guest's `php` alternative to the requested version. The version
@@ -303,3 +377,26 @@ pub const TCPDUMP_START: &str =
 
 /// Parse the capture in the guest — no host pcap dependency.
 pub const TCPDUMP_PARSE: &str = "tcpdump -r /tmp/cap.pcap -n 2>/dev/null || true";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_uses_auto_headless_uses_bypass() {
+        let interactive = claude_run(None);
+        assert!(interactive.contains("claude --permission-mode auto"));
+        assert!(!interactive.contains("--dangerously-skip-permissions"));
+
+        let headless = claude_run(Some("fix it"));
+        assert!(headless.contains("claude --dangerously-skip-permissions -p"));
+        assert!(headless.contains("fix it"));
+
+        // Both seed onboarding + workspace trust before launching.
+        for script in [&interactive, &headless] {
+            assert!(script.contains("\"hasCompletedOnboarding\": true"));
+            assert!(script.contains("\"/workspace\""));
+            assert!(script.contains("\"hasTrustDialogAccepted\": true"));
+        }
+    }
+}

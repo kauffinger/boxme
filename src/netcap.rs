@@ -32,6 +32,15 @@ pub const STRICT_DOMAINS: &[&str] = &[
     "nodejs.org",
 ];
 
+/// Hosts `boxme claude` must reach regardless of the per-project allowlist:
+/// Anthropic's services. `anthropic.com` covers the inference API
+/// (`api.anthropic.com`); `claude.com` covers `platform.claude.com`, which
+/// Claude Code v2 contacts at startup even with non-essential traffic disabled
+/// (telemetry/error reporting are still off via env in `scripts::claude_run`).
+/// Both are suffix matches, so every Anthropic-owned subdomain is reachable while
+/// third-party hosts stay denied.
+pub const CLAUDE_DOMAINS: &[&str] = &["anthropic.com", "claude.com"];
+
 #[derive(Debug, Clone)]
 pub struct NetworkContact {
     pub domain: Option<String>,

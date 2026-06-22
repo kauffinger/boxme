@@ -19,7 +19,7 @@ use microsandbox::sandbox::SandboxStatus;
 use microsandbox::{NetworkPolicy, Sandbox};
 use owo_colors::OwoColorize;
 
-use crate::allowlist;
+use crate::allowlist::{self, Scope};
 use crate::cli::Cli;
 use crate::detect;
 use crate::run::{
@@ -467,8 +467,8 @@ async fn dev_session_running(name: &str) -> bool {
 fn dev_policy(cli: &Cli, project_dir: &Path) -> NetworkPolicy {
     if cli.strict {
         strict_policy()
-    } else if allowlist::exists(project_dir) {
-        enforced_policy(&allowlist::load(project_dir))
+    } else if allowlist::exists(project_dir, Scope::Packages) {
+        enforced_policy(&allowlist::load(project_dir, Scope::Packages))
     } else {
         observe_policy()
     }

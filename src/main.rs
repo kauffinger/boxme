@@ -1,4 +1,6 @@
 mod allowlist;
+mod auth;
+mod claude;
 mod cli;
 mod copyback;
 mod detect;
@@ -22,6 +24,9 @@ async fn main() {
         cli::Command::Setup { force, disk } => setup::setup(*force, *disk).await,
         cli::Command::Dev { port, cmd } => dev::dev(&parsed, cmd, port).await,
         cli::Command::Attach { cmd } => dev::attach(cmd).await,
+        cli::Command::Claude { prompt } => claude::claude(&parsed, prompt).await,
+        cli::Command::Login => auth::login(),
+        cli::Command::Logout => auth::logout(),
         cli::Command::Run(args) => run::run(&parsed, args).await,
     };
     if let Err(e) = result {
