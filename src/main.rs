@@ -2,6 +2,7 @@ mod allowlist;
 mod auth;
 mod claude;
 mod cli;
+mod composer_auth;
 mod copyback;
 mod detect;
 mod dev;

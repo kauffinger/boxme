@@ -7,10 +7,12 @@ use microsandbox::{NetworkPolicy, Sandbox, Volume};
 use microsandbox_network::policy::{
     Action, Destination, DestinationGroup, Direction, DomainName, PortRange, Protocol, Rule,
 };
+use microsandbox_network::secrets::config::SecretEntry;
 use owo_colors::OwoColorize;
 
 use crate::allowlist::{self, Scope};
 use crate::cli::Cli;
+use crate::composer_auth;
 use crate::copyback::{self, CopyPlan};
 use crate::detect;
 use crate::manifest::{self, Change, WriteSet};
@@ -62,6 +64,10 @@ struct RunCtx<'a> {
     php: &'a str,
     node: Option<u32>,
     env: Vec<(String, String)>,
+    /// composer auth.json credentials to register as TLS-proxy secrets (empty
+    /// unless `--composer-auth` and the tool is composer). Adding any of these
+    /// to the builder auto-enables 443 TLS interception.
+    secrets: Vec<SecretEntry>,
 }
 
 pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
@@ -86,7 +92,15 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
             .unwrap_or_else(|| format!("{} (default)", scripts::BASE_NODE_MAJOR)),
     );
 
-    let env = resolve_env(&cli.env)?;
+    let mut env = resolve_env(&cli.env)?;
+    // `--composer-auth` lifts the host's global auth.json into the guest as
+    // placeholder secrets the in-guest TLS proxy substitutes per host. Only
+    // composer authenticates with it, so npm runs ignore the flag.
+    let secrets = if cli.composer_auth && tool == "composer" {
+        composer_auth::inject(&mut env)?
+    } else {
+        Vec::new()
+    };
     ensure_cache_volumes().await?;
 
     let ctx = RunCtx {
@@ -98,6 +112,7 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
         php: &php,
         node,
         env,
+        secrets,
     };
 
     // A run learns (observe + pick) when asked to, or the first time a project
@@ -670,8 +685,14 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
         .cpus(ctx.cli.cpus)
         .replace()
         .volume("/root/.n", |m| m.named("boxme-node-versions"))
-        .volume("/ws-lower", |m| m.bind(project_dir.clone()).readonly())
-        .network(|n| n.policy(policy));
+        .volume("/ws-lower", |m| m.bind(project_dir.clone()).readonly());
+    // Register composer-auth secrets before `.network` so the builder validates
+    // them; the first one flips on 443 TLS interception with the safe defaults
+    // (verify upstream, block QUIC fallback).
+    for entry in &ctx.secrets {
+        builder = builder.secret_entry(entry.clone());
+    }
+    builder = builder.network(|n| n.policy(policy));
     for (key, value) in &ctx.env {
         builder = builder.env(key, value);
     }

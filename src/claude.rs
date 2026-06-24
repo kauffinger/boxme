@@ -19,11 +19,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use microsandbox::{NetworkPolicy, Sandbox};
+use microsandbox_network::secrets::config::SecretEntry;
 use owo_colors::OwoColorize;
 
 use crate::allowlist::{self, Scope};
 use crate::auth;
 use crate::cli::Cli;
+use crate::composer_auth;
 use crate::copyback::{self, CopyPlan};
 use crate::detect;
 use crate::manifest::{self, Change};
@@ -68,12 +70,19 @@ pub async fn claude(cli: &Cli, prompt_parts: &[String]) -> Result<()> {
             .unwrap_or_else(|| format!("{} (default)", scripts::BASE_NODE_MAJOR)),
     );
 
-    let env = resolve_claude_env(cli)?;
+    let mut env = resolve_claude_env(cli)?;
+    // The agent runs composer itself, so `--composer-auth` lets it install your
+    // private packages — the credentials stay placeholder-only inside the box.
+    let secrets = if cli.composer_auth {
+        composer_auth::inject(&mut env)?
+    } else {
+        Vec::new()
+    };
     ensure_cache_volumes().await?;
     let policy = net_policy(cli, &project_dir);
 
     let name = vm_name(&project_dir);
-    let sb = boot(cli, &project_dir, policy, &env, &name).await?;
+    let sb = boot(cli, &project_dir, policy, &env, &secrets, &name).await?;
 
     let outcome = run_in_guest(
         &sb,
@@ -411,19 +420,38 @@ async fn boot(
     project_dir: &Path,
     policy: NetworkPolicy,
     env: &[(String, String)],
+    secrets: &[SecretEntry],
     name: &str,
 ) -> Result<Sandbox> {
     eprintln!("{} '{name}' from {BASE_SNAPSHOT}...", ">> booting".dimmed());
     let project_dir =
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let intercept = !secrets.is_empty();
     let mut builder = Sandbox::builder(name)
         .from_snapshot(BASE_SNAPSHOT)
         .memory(cli.memory)
         .cpus(cli.cpus)
         .replace()
         .volume("/root/.n", |m| m.named("boxme-node-versions"))
-        .volume("/ws-lower", |m| m.bind(project_dir).readonly())
-        .network(|n| n.policy(policy));
+        .volume("/ws-lower", |m| m.bind(project_dir).readonly());
+    for entry in secrets {
+        builder = builder.secret_entry(entry.clone());
+    }
+    // Keep the agent's own Anthropic traffic out of interception — only the
+    // composer-auth hosts need MITM, and the API is reached over its real cert.
+    builder = builder.network(move |n| {
+        let n = n.policy(policy);
+        if intercept {
+            n.tls(|t| {
+                t.bypass("anthropic.com")
+                    .bypass("*.anthropic.com")
+                    .bypass("claude.com")
+                    .bypass("*.claude.com")
+            })
+        } else {
+            n
+        }
+    });
     for (key, value) in env {
         builder = builder.env(key, value);
     }

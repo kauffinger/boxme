@@ -78,8 +78,9 @@ Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
 `run::run`. `cli.rs` uses clap derive; `setup`, `dev`, `attach`, `claude`, `login`
 and `logout` are named subcommands, and everything else falls into an
 `#[command(external_subcommand)] Run(Vec<String>)`, which is why `boxme composer i`
-works — global flags (`--strict`, `--learn`, `--keep`, `--memory`, `--cpus`, `-e`)
-must come *before* the package-manager command (and before `claude`).
+works — global flags (`--strict`, `--learn`, `--keep`, `--composer-auth`,
+`--memory`, `--cpus`, `-e`) must come *before* the package-manager command (and
+before `claude`).
 
 `run.rs` is the orchestrator and the file to read first. It validates the tool
 is `composer`/`npm`, detects versions, then chooses one of two paths:
@@ -280,6 +281,30 @@ assumption; verify these on a real `boxme dev` run.
   `auth`-stored token — and the run bails before booting if none is found.
   `--learn` observes (open egress) and writes the contacted hosts to
   `.boxme/claude-allow`; otherwise it always enforces.
+- `composer_auth.rs` — the `--composer-auth` path: lift the host's global
+  composer `auth.json` (`COMPOSER_HOME`/XDG/`~/.composer` precedence) into the
+  guest as microsandbox **placeholder secrets**, never the raw values. `build`
+  walks the parsed JSON, swaps every `http-basic` password / `github-oauth` /
+  `gitlab-*` / `bearer` token for a `__BOXME_COMPOSER_SECRET_N__` placeholder, and
+  emits a `SecretEntry` per credential (`allowed_hosts` = `*.host`, github also
+  gets `*.githubusercontent.com`; token sections enable header/basic/query
+  injection, http-basic keeps the basic+header default; `require_tls_identity`
+  on). `inject` is the shared entry point each path calls under its own gate:
+  it pushes `COMPOSER_AUTH` (the placeholder JSON) and `NODE_EXTRA_CA_CERTS`
+  (= `GUEST_TLS_CA_PATH`, so Node trusts the proxy CA — composer's PHP-curl and
+  git already trust the system store the guest agent updates) onto the env, and
+  returns the secrets. Registering any secret on the builder (`secret_entry`)
+  auto-enables 443 TLS interception with the safe defaults (verify upstream,
+  block QUIC). The guest only ever sees placeholders; the host-side TLS proxy
+  splices the real value into the outgoing request only for a TLS-intercepted
+  connection whose SNI matches the credential's host, and the default
+  `BlockAndLog` violation action blocks any attempt to send a placeholder to a
+  *different* host. So a credential can leave the box only toward the one host it
+  already authenticates. `run.rs` gates on `--composer-auth && tool == composer`;
+  `claude.rs` on `--composer-auth` (and bypasses the Anthropic/Claude domains
+  from interception so the agent's own API traffic is untouched); `dev.rs` on
+  `--composer-auth && has_composer`. The credential never enters the guest, so it
+  is never copied back. Pure `build` logic is unit-tested.
 - `auth.rs` — stores the Claude Code OAuth token (`claude setup-token`) that
   `boxme claude` injects as `CLAUDE_CODE_OAUTH_TOKEN`, so the credential lives in
   the macOS Keychain (`security` generic-password, service `boxme-claude-oauth`)
@@ -335,6 +360,14 @@ decision with a team.
 - The out-of-workspace scan uses `-newercm` (ctime, which the guest can't
   backdate with `touch -t`) against a marker stamped *after* setup but *before*
   the command, so it reports only what the command itself wrote.
+- `--composer-auth` must never put a raw credential in the guest. The real token
+  only ever lives in the host-side TLS proxy (`SecretEntry.value`); the guest
+  receives a placeholder. Keep `require_tls_identity` on and `allowed_hosts`
+  scoped to the credential's own host so substitution happens only on a verified,
+  host-matched TLS connection — and leave the violation action at its
+  `BlockAndLog` default so a placeholder aimed at any other host is blocked.
+  Don't widen `allowed_hosts` to `Any` or add a placeholder to a plaintext
+  channel.
 
 ## Conventions
 

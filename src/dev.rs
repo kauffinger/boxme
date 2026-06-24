@@ -17,10 +17,12 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use microsandbox::sandbox::SandboxStatus;
 use microsandbox::{NetworkPolicy, Sandbox};
+use microsandbox_network::secrets::config::SecretEntry;
 use owo_colors::OwoColorize;
 
 use crate::allowlist::{self, Scope};
 use crate::cli::Cli;
+use crate::composer_auth;
 use crate::detect;
 use crate::run::{
     cleanup, enforced_policy, ensure_cache_volumes, observe_policy, quote_args, resolve_env,
@@ -61,7 +63,14 @@ pub async fn dev(cli: &Cli, cmd: &[String], port_specs: &[String]) -> Result<()>
             .unwrap_or_else(|| format!("{} (default)", scripts::BASE_NODE_MAJOR)),
     );
 
-    let env = resolve_env(&cli.env)?;
+    let mut env = resolve_env(&cli.env)?;
+    // Dependencies install in-guest, so `--composer-auth` is what lets a dev
+    // session pull private composer packages — placeholder-only inside the box.
+    let secrets = if cli.composer_auth && has_composer {
+        composer_auth::inject(&mut env)?
+    } else {
+        Vec::new()
+    };
     let policy = dev_policy(cli, &project_dir);
     ensure_cache_volumes().await?;
 
@@ -76,7 +85,7 @@ pub async fn dev(cli: &Cli, cmd: &[String], port_specs: &[String]) -> Result<()>
     // Bump any host port that's already taken (e.g. another repo's dev session)
     // to the next free one before publishing.
     let ports = resolve_free_ports(&ports)?;
-    let sb = boot_dev(cli, &name, &ports, policy, &env).await?;
+    let sb = boot_dev(cli, &name, &ports, policy, &env, &secrets).await?;
 
     let session = dev_session(
         &sb,
@@ -136,6 +145,7 @@ async fn boot_dev(
     ports: &[(u16, u16)],
     policy: NetworkPolicy,
     env: &[(String, String)],
+    secrets: &[SecretEntry],
 ) -> Result<Sandbox> {
     eprintln!("{} '{name}' from {BASE_SNAPSHOT}...", ">> booting".dimmed());
     let mut builder = Sandbox::builder(name)
@@ -143,8 +153,13 @@ async fn boot_dev(
         .memory(cli.memory)
         .cpus(cli.cpus)
         .replace()
-        .volume("/root/.n", |m| m.named("boxme-node-versions"))
-        .network(|n| n.policy(policy));
+        .volume("/root/.n", |m| m.named("boxme-node-versions"));
+    // Composer-auth secrets before `.network` (validates them; auto-enables
+    // 443 TLS interception with verify-upstream + QUIC blocking).
+    for entry in secrets {
+        builder = builder.secret_entry(entry.clone());
+    }
+    builder = builder.network(|n| n.policy(policy));
     for (host, guest) in ports {
         builder = builder.port(*host, *guest);
     }

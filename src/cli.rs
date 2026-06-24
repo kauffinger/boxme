@@ -18,6 +18,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub learn: bool,
 
+    /// Inject your global composer `auth.json` (`~/.config/composer/auth.json`)
+    /// into the sandbox as TLS-proxy secrets: the guest only ever sees opaque
+    /// placeholders, while microsandbox substitutes the real tokens onto the
+    /// wire — and only for each credential's own host. A private repo still has
+    /// to be reachable (`.boxme/allow`); the credential rides along once it is.
+    #[arg(short = 'a', long, global = true)]
+    pub composer_auth: bool,
+
     /// Keep the VM running after the run instead of removing it.
     #[arg(long, global = true)]
     pub keep: bool,

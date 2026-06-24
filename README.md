@@ -80,6 +80,7 @@ boxme --strict composer install   # deny-by-default network: registries only
 boxme --learn composer install    # re-open the host picker to re-curate
 boxme --keep npm install          # keep the VM around afterwards
 boxme --memory 4096 --cpus 4 composer update
+boxme -a composer install         # --composer-auth: inject ~/.config/composer/auth.json as unleakable secrets
 
 # The whole project is mounted read-only and the existing vendor/ and
 # node_modules/ stay visible, so an incremental command only does incremental
@@ -96,6 +97,36 @@ Anything you pass with `-e` is visible to the package code running in the
 sandbox — a malicious postinstall could read it and try to send it somewhere.
 The Network tab shows every destination contacted; `--strict` limits where
 anything can go.
+
+### Private composer repositories (`--composer-auth`)
+
+If your `composer.json` pulls from private repos (Flux, a private Satis, a
+GitHub PAT for private packages), composer needs credentials — but putting them
+in the box with `-e COMPOSER_AUTH` hands the raw tokens to every postinstall
+script and plugin that runs there. `--composer-auth` (`-a`) does it safely:
+
+```sh
+boxme --composer-auth composer install
+boxme -a composer install            # same thing, shorthand
+```
+
+It reads your global `~/.config/composer/auth.json` and injects each credential
+as a microsandbox **secret**. The guest only ever sees an opaque placeholder;
+the real token lives in a host-side TLS proxy that splices it into the outgoing
+request — and **only** on a connection to that credential's own host. Package
+code (and the Claude agent, and dev-server tooling) can never read the real
+value, and if any of it copies a placeholder and aims it at a different host,
+microsandbox blocks the request. So a leaked credential can travel exactly one
+place: the host it already authenticates.
+
+Reachability is unchanged — a private repo still has to be allowed through the
+network policy (`.boxme/allow`, via the review or `--learn`) to be contacted at
+all. `--composer-auth` only attaches the credential once the host is reachable.
+`github.com` is a built-in registry, so a `github-oauth` token works right away.
+
+The flag also works with `boxme claude` (so the agent can install your private
+packages) and `boxme dev` (which installs deps in-guest). It only injects
+composer credentials; an `npm install` run ignores it.
 
 ## Dev server
 
