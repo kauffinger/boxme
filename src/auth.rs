@@ -15,8 +15,10 @@ use owo_colors::OwoColorize;
 /// Claude Code reads (`claude setup-token`'s output).
 pub const TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
-/// Keychain item coordinates (macOS) / file name stem (Linux).
+/// Keychain item coordinates (macOS only; Linux stores a `0600` file instead).
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "boxme-claude-oauth";
+#[cfg(target_os = "macos")]
 const ACCOUNT: &str = "claude";
 
 /// `boxme login`: prompt for the token and store it. Reads a single line from

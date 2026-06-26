@@ -148,7 +148,9 @@ fn build(mut value: serde_json::Value) -> Option<ComposerAuth> {
             let Some(password) = creds.get_mut("password") else {
                 continue;
             };
-            let Some(real) = password.as_str() else { continue };
+            let Some(real) = password.as_str() else {
+                continue;
+            };
             let idx = secrets.len();
             secrets.push(secret(
                 idx,
@@ -271,8 +273,11 @@ mod tests {
             }"#,
         );
         assert_eq!(auth.secrets.len(), 3);
-        let mut placeholders: Vec<&str> =
-            auth.secrets.iter().map(|s| s.placeholder.as_str()).collect();
+        let mut placeholders: Vec<&str> = auth
+            .secrets
+            .iter()
+            .map(|s| s.placeholder.as_str())
+            .collect();
         placeholders.sort();
         placeholders.dedup();
         assert_eq!(placeholders.len(), 3, "placeholders must be unique");
