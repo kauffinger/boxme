@@ -103,11 +103,20 @@ run replaces it.
     `.npmrc` — allow it and retry once:
     `boxme discard && boxme allow <host> && boxme --json <same command>`.
     Any other blocked host: leave the changeset staged, report it, move on.
-  - `unexpected_files` or `outside_writes`: **never apply.** These are
-    supply-chain red flags (a postinstall script wrote outside the expected
-    vendor/lockfile surface). Leave the changeset staged, include the file list
-    (`files[]` entries with `expected: false`, and `outside.files[]`) in the
-    final report, and move on.
+  - `unexpected_files`: inspect before deciding. Read each `files[]` entry
+    with `expected: false` — its `diff` in the report when present, otherwise
+    the staged content via
+    `tar xzf .boxme/pending/changeset.tgz -O -- <path>`. Inspection is
+    **read-only**: never execute, source, or import anything from a staged
+    changeset. Apply only if every unexpected change is plainly benign for the
+    command that ran (e.g. a metadata/manifest file a package legitimately
+    regenerates, a patch applied by a patches plugin). Anything you can't
+    positively explain — new executable or script files, edits to app source,
+    CI/config, dotfiles — leave the changeset staged, include it in the final
+    report, and move on. When unsure, don't apply.
+  - `outside_writes`: **never apply.** Writes outside `/workspace` are a
+    supply-chain red flag. Leave the changeset staged, include
+    `outside.files[]` in the final report, and move on.
   - `network_capture_unavailable` / `outside_scan_unavailable`: the integrity
     evidence is missing, so don't auto-apply; leave staged and flag for the
     user.
@@ -147,8 +156,9 @@ End with a per-repo summary the user can act on:
 - Never run composer/npm mutations on the host; only `composer audit
   --locked --no-plugins` and `npm audit` (read-only, no project code) are
   allowed host-side.
-- Never apply a changeset whose findings include `unexpected_files` or
-  `outside_writes`.
+- Never apply a changeset whose findings include `outside_writes`. Unexpected
+  files may be applied only after reading every one and finding it benign —
+  and never execute, run, or source any file from a staged changeset.
 - Never use `npm audit fix --force` or `composer fix --force`, never edit
   version constraints in `composer.json`/`package.json` to force a
   vulnerability fix — breaking fixes are reported, not applied.

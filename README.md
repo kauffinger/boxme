@@ -323,9 +323,10 @@ boxme skills
   into the sandbox image) and `npm audit fix`, non-breaking fixes only. Anything
   that would need a constraint or major bump is reported, never forced.
 
-Both skills inherit boxme's guarantees: every install runs sandboxed, and a
-changeset whose report shows unexpected files, out-of-workspace writes, or
-blocked hosts is left staged for your review instead of being applied.
+Both skills inherit boxme's guarantees: every install runs sandboxed, and only
+clean changesets are applied automatically. Unexpected files are read (never
+executed) and applied only when plainly benign; out-of-workspace writes and
+unexplained blocked hosts leave the changeset staged for your review.
 
 [innobrain/composer-fix]: https://packagist.org/packages/innobrain/composer-fix
 
