@@ -21,7 +21,9 @@ pub struct CopyPlan {
 /// be applied to the project. Produced by [`stage`] while the VM is alive;
 /// consumed by [`commit`] after the VM (and its read-only bind of the project)
 /// is gone — the project is the live overlay lower during the run, so it must
-/// not be mutated until the mount is torn down.
+/// not be mutated until the mount is torn down. Serializable so a `--json` run
+/// can park it on disk ([`persist`]) for a later `boxme apply` ([`load_staged`]).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Staged {
     /// Host path to the result tarball, or `None` if nothing was packed.
     tgz: Option<PathBuf>,
@@ -100,6 +102,41 @@ pub async fn stage(sb: &Sandbox, project_dir: &Path, plan: &CopyPlan) -> Result<
         replace_dirs,
         deletions: plan.deletions.clone(),
     })
+}
+
+/// Park a staged changeset in `dir` (which must exist) so it survives this
+/// process: the tarball moves in as `changeset.tgz` and the metadata lands in
+/// `staged.json`. The `--json` two-step flow stages here and a later
+/// `boxme apply` picks it up via [`load_staged`].
+pub fn persist(mut staged: Staged, dir: &Path) -> Result<()> {
+    if let Some(tgz) = staged.tgz.take() {
+        let dest = dir.join("changeset.tgz");
+        move_file(&tgz, &dest)?;
+        staged.tgz = Some(dest);
+    }
+    std::fs::write(dir.join("staged.json"), serde_json::to_vec_pretty(&staged)?)
+        .with_context(|| format!("writing {}/staged.json failed", dir.display()))?;
+    Ok(())
+}
+
+/// Load a changeset parked by [`persist`].
+pub fn load_staged(dir: &Path) -> Result<Staged> {
+    let path = dir.join("staged.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {} failed", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parsing {} failed", path.display()))
+}
+
+/// Rename, falling back to copy+remove for a cross-filesystem move (the staged
+/// tarball starts life in the system temp dir).
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)
+        .with_context(|| format!("moving {} to {} failed", from.display(), to.display()))?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
 }
 
 /// Write a staged changeset into `base` (an already-canonical dir): replace the
@@ -406,5 +443,34 @@ mod tests {
     fn porcelain_paths_preserves_spaces_in_names() {
         let out = " M dir/a file.txt\0";
         assert_eq!(porcelain_paths(out), vec!["dir/a file.txt"]);
+    }
+
+    #[test]
+    fn persist_then_load_roundtrips_and_moves_the_tarball() {
+        let dir = std::env::temp_dir().join(format!("boxme-persist-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let tgz = dir.join("orig.tgz");
+        std::fs::write(&tgz, b"tarball").unwrap();
+        let staged = Staged {
+            tgz: Some(tgz.clone()),
+            replace_dirs: vec!["vendor".to_string()],
+            deletions: vec!["old.txt".to_string()],
+        };
+
+        persist(staged, &dir).unwrap();
+        assert!(!tgz.exists(), "original tarball should have moved");
+        assert!(dir.join("changeset.tgz").exists());
+
+        let loaded = load_staged(&dir).unwrap();
+        assert_eq!(
+            loaded.tgz.as_deref(),
+            Some(dir.join("changeset.tgz").as_path())
+        );
+        assert_eq!(loaded.replace_dirs, vec!["vendor"]);
+        assert_eq!(loaded.deletions, vec!["old.txt"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

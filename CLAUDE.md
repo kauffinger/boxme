@@ -31,6 +31,11 @@ boxme claude                # run Claude Code in the sandbox interactively, copy
 boxme claude 'fix the bug'  # one-shot headless agent run; needs a stored token (boxme login) or an env credential
 boxme login                 # save the `claude setup-token` token to the keychain so `boxme claude` can auth
 boxme logout                # remove the stored token
+
+boxme --json composer i     # non-interactive: JSON report on stdout, changeset staged to .boxme/pending (not applied)
+boxme apply                 # copy the staged changeset into the project (second step of the --json flow)
+boxme discard               # drop the staged changeset instead
+boxme allow foo.com         # add allowlist host(s) without the TUI (=exact.host for exact-only)
 ```
 
 ## Releasing
@@ -62,7 +67,8 @@ libdbus-sys, and libcap-ng, which msb_krun links for Linux capability handling).
 msb_krun is otherwise pure Rust, so there is no libkrun system package.
 
 Tests are pure unit tests in `#[cfg(test)] mod tests` blocks (in `netcap.rs`,
-`allowlist.rs`, `manifest.rs`, `outside.rs`, `review.rs`). There is no
+`allowlist.rs`, `manifest.rs`, `outside.rs`, `review.rs`, `report.rs`,
+`copyback.rs`). There is no
 integration-test harness — anything touching the sandbox is exercised by running
 `boxme` against a real project. There is no rustfmt/clippy config and no
 toolchain pin; default stable applies.
@@ -74,16 +80,19 @@ Note the deliberate version ceiling on `time` in `Cargo.toml`: `>=0.3.6,
 ## Architecture
 
 Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
-`dev::dev`, `dev::attach`, `claude::claude`, `auth::login`, `auth::logout`, or
-`run::run`. `cli.rs` uses clap derive; `setup`, `dev`, `attach`, `claude`, `login`
-and `logout` are named subcommands, and everything else falls into an
-`#[command(external_subcommand)] Run(Vec<String>)`, which is why `boxme composer i`
-works — global flags (`--strict`, `--learn`, `--keep`, `--composer-auth`,
-`--memory`, `--cpus`, `-e`) must come *before* the package-manager command (and
-before `claude`).
+`dev::dev`, `dev::attach`, `claude::claude`, `auth::login`, `auth::logout`,
+`report::apply`, `report::discard`, `run::allow_hosts`, or `run::run`. `cli.rs`
+uses clap derive; `setup`, `dev`, `attach`, `claude`, `login`, `logout`,
+`apply`, `discard` and `allow` are named subcommands, and everything else falls
+into an `#[command(external_subcommand)] Run(Vec<String>)`, which is why
+`boxme composer i` works — global flags (`--strict`, `--learn`, `--keep`,
+`--composer-auth`, `--json`, `--memory`, `--cpus`, `-e`) must come *before* the
+package-manager command (and before `claude`). `run::run` returns an exit code
+(`main` propagates it) so the `--json` report can drive scripts.
 
 `run.rs` is the orchestrator and the file to read first. It validates the tool
-is `composer`/`npm`, detects versions, then chooses one of two paths:
+is `composer`/`npm`, detects versions, then chooses one of three paths (the TUI
+paths fail fast with a pointer to `--json` when stdin/stdout isn't a terminal):
 
 - **`enforced_run`** — deny-by-default pass: boot under the allowlist, run,
   review, copy back on approval. If the user marks blocked hosts and confirms,
@@ -97,12 +106,25 @@ is `composer`/`npm`, detects versions, then chooses one of two paths:
   copies back directly (if nothing it touched would be blocked under
   enforcement) or discards the observe VM and re-runs via `enforced_run` for a
   clean result.
+- **`json_run`** — the non-interactive path (`--json`, for agents/scripts/CI):
+  always enforces (never learns — no one is present to vouch for a host; with no
+  allowlist it's registries-only and the report lists what was blocked for
+  `boxme allow <host>` + re-run), streams the command's output to stderr, stages
+  the changeset under `.boxme/pending/` (self-gitignored; `copyback::persist`),
+  tears the VM down, and prints a JSON `report::Report` to stdout — file diffs
+  partitioned expected/unexpected, network contacts classified, outside writes,
+  guest exit code. **Nothing is applied**: the explicit second step is
+  `boxme apply` (`copyback::load_staged` + `commit`) or `boxme discard`. Exit
+  codes: 0 clean, 1 boxme error, 2 command failed (nothing staged), 3 findings
+  (`blocked_hosts`, `unexpected_files`, `outside_writes`, plus
+  `command_failed` / `*_unavailable`) — derived in `Report::finalize`.
 
-`run_command` is the shared core both paths call: mount the project read-only as
+`run_command` is the shared core all paths call: mount the project read-only as
 an overlay lower + tag a guest git baseline (`scripts::UNPACK`, no tar copy-in) →
 switch PHP/Node versions → snapshot the file manifest → start tcpdump → run the
-command interactively via `attach_with` → stop capture → diff the manifest → scan
-for out-of-workspace writes → build the review rows.
+command interactively via `attach_with` (streamed via `stream_shell_stderr`
+under `--json`, keeping stdout clean for the report) → stop capture → diff the
+manifest → scan for out-of-workspace writes → build the review rows.
 
 `claude.rs` is a separate path (`boxme claude [PROMPT]`) that reuses the review
 run's integrity core for an AI agent instead of a package manager. It boots the
@@ -234,6 +256,12 @@ assumption; verify these on a real `boxme dev` run.
 - `review.rs` — the ratatui TUI (Files / Network / Outside tabs, inline diffs,
   host selection in learn and enforce runs, the allow-and-re-run confirmation).
   Returns a `Decision` (approve / abort / re-run) plus the chosen hosts.
+- `report.rs` — the non-interactive (`--json`) surface: the serializable
+  `Report` (with `finalize` deriving `findings`/`clean` and `exit_code_for`
+  mapping them to the documented exit codes), the `.boxme/pending` lifecycle
+  (`save_pending` writes a `*` .gitignore so the staged changeset can't be
+  committed, keeps a `report.json` copy next to it), and the `boxme apply` /
+  `boxme discard` subcommands. Findings/exit-code logic is unit-tested here.
 - `copyback.rs` — applies the changeset in two phases so the host tree is never
   mutated while it's a live overlay lower: `stage` tars the approved paths out of
   the guest into a host-side tarball (VM alive, read-only), then — after teardown
@@ -250,6 +278,9 @@ assumption; verify these on a real `boxme dev` run.
   exposes the staged path so an aborted copy-out points the user at their
   not-yet-applied changes instead of dropping them. (There is no longer a
   clean-repo preflight — the default copy-out is in place, branch is the fallback.)
+  `Staged` is serde-serializable: `persist`/`load_staged` park it under
+  `.boxme/pending` so a `--json` run and a later `boxme apply` can be separate
+  processes.
 - `dev.rs` — the `boxme dev` path: boot a writable guest with ports forwarded,
   copy in (this path still tars in via `tar_directory`, *not* the overlay — it
   installs deps in-guest and needs a writable tree), install deps in-guest, run

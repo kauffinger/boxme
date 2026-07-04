@@ -319,12 +319,22 @@ pub fn npm_platform_env(os: &str, cpu: &str) -> String {
 /// lines (a guest-controlled name must not be able to forge a review entry).
 /// `md5sum -z` likewise NUL-terminates and disables its backslash-escaping of
 /// special characters in names.
+///
+/// Per-file stat/hash failures are non-fatal: stderr is dropped and the script
+/// always exits 0. A volatile runtime file (e.g. Statamic's `storage` stache
+/// cache, which a still-running host process can rewrite mid-run) can return
+/// `ESTALE`/"Stale file handle" through the virtiofs overlay lower; letting
+/// `find`/`md5sum`'s non-zero exit propagate here would abort the whole run
+/// *after* the command finished, losing the review and any copy-back. A file
+/// that lists but won't hash just arrives with no md5, and `manifest::diff`
+/// already falls back to size comparison for those.
 pub const MANIFEST: &str = r#"
 cd /workspace
 printf '#FILES\0'
-find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -printf '%s\t%y\t%P\0'
+find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -printf '%s\t%y\t%P\0' 2>/dev/null
 printf '#MD5\0'
-find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -type f -print0 | xargs -0 -r md5sum -z
+find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -type f -print0 2>/dev/null | xargs -0 -r md5sum -z 2>/dev/null
+exit 0
 "#;
 
 /// Count files inside an expected dir (for the "vendor/: 4321 files" summary).

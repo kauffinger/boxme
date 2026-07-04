@@ -26,6 +26,15 @@ pub struct Cli {
     #[arg(short = 'a', long, global = true)]
     pub composer_auth: bool,
 
+    /// Non-interactive mode for scripts and agents: skip the review TUI, print
+    /// a JSON report of everything the command did to stdout (guest output goes
+    /// to stderr), and stage the changeset under `.boxme/pending` instead of
+    /// applying it. Review the report, then `boxme apply` or `boxme discard`.
+    /// Always enforces the network policy (use `boxme allow` to extend it).
+    /// Exit codes: 0 clean, 1 boxme error, 2 command failed, 3 findings.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Keep the VM running after the run instead of removing it.
     #[arg(long, global = true)]
     pub keep: bool,
@@ -116,6 +125,24 @@ pub enum Command {
 
     /// Remove the stored Claude token from your keychain.
     Logout,
+
+    /// Copy the changeset staged by a `boxme --json <command>` run into the
+    /// project, then remove it from `.boxme/pending`. The explicit second step
+    /// of the non-interactive flow.
+    Apply,
+
+    /// Drop the changeset staged by a `boxme --json <command>` run without
+    /// applying it.
+    Discard,
+
+    /// Add host(s) to the package-run allowlist (`.boxme/allow`) without the
+    /// review TUI — the non-interactive counterpart of trusting a host in the
+    /// review. A bare host matches the domain and all subdomains; prefix with
+    /// `=` for that exact host only.
+    Allow {
+        #[arg(required = true, value_name = "HOST")]
+        hosts: Vec<String>,
+    },
 
     /// Anything else is the package-manager command to run, e.g. `boxme composer i`.
     #[command(external_subcommand)]

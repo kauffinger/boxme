@@ -128,6 +128,38 @@ The flag also works with `boxme claude` (so the agent can install your private
 packages) and `boxme dev` (which installs deps in-guest). It only injects
 composer credentials; an `npm install` run ignores it.
 
+## Non-interactive mode (agents, scripts, CI)
+
+Without a terminal there is no review TUI, so plain `boxme composer install`
+fails fast and points here. `--json` replaces the TUI with a two-step flow that
+keeps the same guarantee — nothing touches your tree until an explicit approval:
+
+```sh
+boxme --json composer install   # run + report; changeset staged, NOT applied
+boxme apply                     # step 2a: copy the staged changeset into the project
+boxme discard                   # step 2b: drop it instead
+boxme allow some-host.com       # trust a blocked host without the TUI, then re-run
+```
+
+Step 1 runs the command under deny-by-default enforcement (registries plus
+`.boxme/allow`; `--learn` is TUI-only), streams the command's output to stderr,
+and prints a JSON report to stdout: every changed file (with diffs, partitioned
+expected vs unexpected), every network contact (`registry` / `allowed` /
+`blocked`), anything written outside `/workspace`, and the guest exit code. The
+changeset is staged under `.boxme/pending/` (self-gitignored) and the report is
+kept next to it, so whoever runs `boxme apply` can still see what they are
+approving. The staged changeset is a plain gzipped tar with project-relative
+paths — `tar tzf .boxme/pending/changeset.tgz` lists it, `tar xzf … -O -- <path>`
+prints one file — and the report's `pending` object carries both commands so an
+agent can discover them without reading docs.
+
+Exit codes: `0` clean (safe to `boxme apply`), `1` boxme itself failed, `2` the
+command failed inside the sandbox (nothing staged), `3` the command succeeded
+but the report has findings — blocked hosts, unexpected files, out-of-workspace
+writes — listed in `findings` for a script to branch on. A typical agent loop:
+run with `--json`; on `3` with `blocked_hosts`, `boxme allow` the hosts it
+trusts and re-run; on `0`, read the report and `boxme apply`.
+
 ## Dev server
 
 `boxme dev` runs your whole dev stack *inside* the sandbox and forwards its ports

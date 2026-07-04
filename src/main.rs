@@ -9,6 +9,7 @@ mod dev;
 mod manifest;
 mod netcap;
 mod outside;
+mod report;
 mod review;
 mod run;
 mod scripts;
@@ -21,17 +22,29 @@ use owo_colors::OwoColorize;
 #[tokio::main]
 async fn main() {
     let parsed = cli::Cli::parse();
+    // `run` maps its non-interactive report onto an exit code; everything else
+    // is success/failure.
     let result = match &parsed.command {
-        cli::Command::Setup { force, disk } => setup::setup(*force, *disk).await,
-        cli::Command::Dev { port, cmd } => dev::dev(&parsed, cmd, port).await,
-        cli::Command::Attach { cmd } => dev::attach(cmd).await,
-        cli::Command::Claude { prompt } => claude::claude(&parsed, prompt).await,
-        cli::Command::Login => auth::login(),
-        cli::Command::Logout => auth::logout(),
+        cli::Command::Setup { force, disk } => setup::setup(*force, *disk).await.map(|()| 0),
+        cli::Command::Dev { port, cmd } => dev::dev(&parsed, cmd, port).await.map(|()| 0),
+        cli::Command::Attach { cmd } => dev::attach(cmd).await.map(|()| 0),
+        cli::Command::Claude { prompt } => claude::claude(&parsed, prompt).await.map(|()| 0),
+        cli::Command::Login => auth::login().map(|()| 0),
+        cli::Command::Logout => auth::logout().map(|()| 0),
+        cli::Command::Apply => report::apply(parsed.json).map(|()| 0),
+        cli::Command::Discard => report::discard(parsed.json).map(|()| 0),
+        cli::Command::Allow { hosts } => run::allow_hosts(hosts).map(|()| 0),
         cli::Command::Run(args) => run::run(&parsed, args).await,
     };
-    if let Err(e) = result {
-        eprintln!("{} {e:#}", "error:".red().bold());
-        std::process::exit(1);
+    match result {
+        Ok(code) => {
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Err(e) => {
+            eprintln!("{} {e:#}", "error:".red().bold());
+            std::process::exit(1);
+        }
     }
 }

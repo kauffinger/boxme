@@ -41,6 +41,9 @@ const DEFAULT_PORTS: &[(u16, u16)] = &[(8000, 8000), (5173, 5173)];
 const COALESCE: Duration = Duration::from_millis(80);
 
 pub async fn dev(cli: &Cli, cmd: &[String], port_specs: &[String]) -> Result<()> {
+    if cli.json {
+        bail!("--json applies to package-manager runs, not `boxme dev`");
+    }
     if !base_snapshot_exists().await? {
         bail!("base snapshot missing — run `boxme setup` first");
     }

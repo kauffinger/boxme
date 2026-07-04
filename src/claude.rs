@@ -53,6 +53,12 @@ struct ClaudeRun {
 }
 
 pub async fn claude(cli: &Cli, prompt_parts: &[String]) -> Result<()> {
+    if cli.json {
+        bail!(
+            "--json isn't supported for `boxme claude` yet — a headless run \
+             (`boxme claude 'prompt'`) is already non-interactive"
+        );
+    }
     if !base_snapshot_exists().await? {
         bail!("base snapshot missing — run `boxme setup` first");
     }

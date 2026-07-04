@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,7 @@ use crate::detect;
 use crate::manifest::{self, Change, WriteSet};
 use crate::netcap::{self, NetworkContact};
 use crate::outside::{self, OutsideScan};
+use crate::report;
 use crate::review::{self, Decision, FileItem, FileKind, NetRow, NetStatus, Review};
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
@@ -38,6 +40,9 @@ struct CommandRun {
     changes: Vec<(String, Change)>,
     expected_files: Vec<String>,
     unexpected: Vec<(String, Change)>,
+    /// File counts per expected write-set dir (vendor/, node_modules/), for the
+    /// JSON report — the TUI renders them from `files` summary rows instead.
+    dir_counts: Vec<(String, u64)>,
 }
 
 /// What an enforced review resolves to: either we're finished (copied back or
@@ -70,11 +75,26 @@ struct RunCtx<'a> {
     secrets: Vec<SecretEntry>,
 }
 
-pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
+pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     // 1. Validate + detect.
     let tool = args.first().map(String::as_str).unwrap_or("");
     if !matches!(tool, "composer" | "npm") {
         bail!("boxme only wraps `composer` and `npm` (got `{tool}`)");
+    }
+    if cli.json && cli.learn {
+        bail!(
+            "--learn needs the interactive review; in --json mode, allow blocked \
+             hosts from the report with `boxme allow <host>` and re-run"
+        );
+    }
+    // The review TUI and the attached command both need a terminal — without
+    // one, point at the non-interactive flow instead of hanging or garbling.
+    if !cli.json && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
+        bail!(
+            "no terminal for the review UI — use `boxme --json {tool} …` for the \
+             non-interactive flow (JSON report on stdout, then `boxme apply` or \
+             `boxme discard`)"
+        );
     }
     let write_set = manifest::expected_write_set(tool, &args[1..]);
 
@@ -115,11 +135,23 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
         secrets,
     };
 
+    // --json always enforces: there is no one at the terminal to vouch for an
+    // observed host, so a missing allowlist means registries-only and the report
+    // lists what got blocked for `boxme allow` + re-run.
+    if cli.json {
+        let allow = if cli.strict {
+            Vec::new()
+        } else {
+            allowlist::load(&project_dir, Scope::Packages)
+        };
+        return json_run(&ctx, allow).await;
+    }
+
     // A run learns (observe + pick) when asked to, or the first time a project
     // has no allowlist yet. Otherwise it enforces straight away: `--strict` is
     // registries-only, an existing allowlist is registries + its entries.
     if cli.learn || (!cli.strict && !allowlist::exists(&project_dir, Scope::Packages)) {
-        learn_run(&ctx).await
+        learn_run(&ctx).await?;
     } else {
         // --strict ignores the allowlist (registries only) and disables the
         // allow-and-re-run affordance, since allowlisting wouldn't change it.
@@ -128,8 +160,162 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<()> {
         } else {
             (allowlist::load(&project_dir, Scope::Packages), true)
         };
-        enforced_run(&ctx, allow, can_trust).await
+        enforced_run(&ctx, allow, can_trust).await?;
     }
+    Ok(0)
+}
+
+/// Non-interactive run: enforce, run the command (output streamed to stderr —
+/// stdout is reserved for the report), stage the changeset, tear the VM down,
+/// park the changeset under `.boxme/pending`, print the JSON report, and map it
+/// to the documented exit code. Never mutates the project — that is `boxme
+/// apply`'s job.
+async fn json_run(ctx: &RunCtx<'_>, allow: Vec<String>) -> Result<i32> {
+    let (sb, name) = boot(ctx, enforced_policy(&allow), vm_name(ctx.project_dir)).await?;
+    let outcome = async {
+        let run = run_command(&sb, ctx).await?;
+        // A failed command's half-written result isn't worth staging — the
+        // report still carries everything the run observed.
+        let staged = if run.exit_code == 0 {
+            Some(stage_copy_back(&sb, ctx.project_dir, ctx.write_set, &run).await?)
+        } else {
+            None
+        };
+        Ok::<_, anyhow::Error>((run, staged))
+    }
+    .await;
+    let (run, staged) = match outcome {
+        Ok(v) => {
+            cleanup(ctx.cli, sb, &name).await;
+            v
+        }
+        Err(e) => {
+            discard(sb, &name).await;
+            return Err(e);
+        }
+    };
+
+    // VM is gone — safe to write into the project tree now.
+    let pending = match staged {
+        Some(staged) => Some(report::save_pending(ctx.project_dir, staged)?),
+        None => None,
+    };
+    let report = build_report(ctx, &run, &allow, pending);
+    let json = serde_json::to_string_pretty(&report)?;
+    report::save_report_copy(ctx.project_dir, &json);
+    println!("{json}");
+    Ok(report.exit_code_for())
+}
+
+/// Assemble the JSON report for a finished non-interactive run.
+fn build_report(
+    ctx: &RunCtx<'_>,
+    run: &CommandRun,
+    allow: &[String],
+    pending: Option<String>,
+) -> report::Report {
+    // The per-file diffs were fetched into the review rows; key them by path.
+    let diffs: HashMap<&str, &str> = run
+        .files
+        .iter()
+        .filter(|f| f.kind != FileKind::ExpectedSummary)
+        .filter_map(|f| f.diff.as_deref().map(|d| (f.label.as_str(), d)))
+        .collect();
+
+    let files = run
+        .changes
+        .iter()
+        .map(|(path, change)| report::FileChange {
+            path: path.clone(),
+            change: change_str(*change),
+            expected: ctx.write_set.contains(path),
+            diff: diffs.get(path.as_str()).map(|d| d.to_string()),
+        })
+        .collect();
+
+    let contacts = net_rows(&run.network, |c| enforced_status(c, allow, false))
+        .into_iter()
+        .map(|row| report::NetContact {
+            host: row.contact.host().to_string(),
+            ip: row.contact.ip.clone(),
+            port: row.contact.port,
+            status: match row.status {
+                NetStatus::Known => "registry",
+                NetStatus::Allowed => "allowed",
+                NetStatus::Observed | NetStatus::Blocked => "blocked",
+            },
+        })
+        .collect();
+
+    let mut rep = report::Report {
+        schema: 1,
+        command: run.command.clone(),
+        mode: if ctx.cli.strict { "strict" } else { "enforced" },
+        allowlist: allow.to_vec(),
+        exit_code: run.exit_code,
+        clean: false,
+        findings: Vec::new(),
+        expected_dirs: run
+            .dir_counts
+            .iter()
+            .map(|(dir, files)| report::DirSummary {
+                dir: dir.clone(),
+                files: *files,
+            })
+            .collect(),
+        files,
+        network: report::Network {
+            banner: run.network_banner.clone(),
+            contacts,
+        },
+        outside: report::Outside {
+            banner: run.outside.banner(),
+            truncated: run.outside.truncated,
+            files: run
+                .outside
+                .files
+                .iter()
+                .map(|f| report::OutsideFile {
+                    path: f.path.clone(),
+                    kind: match f.kind {
+                        outside::SysKind::File => "file",
+                        outside::SysKind::Symlink => "symlink",
+                    },
+                    size: f.size,
+                })
+                .collect(),
+        },
+        pending: pending.map(report::Pending::new),
+    };
+    rep.finalize();
+    rep
+}
+
+fn change_str(change: Change) -> &'static str {
+    match change {
+        Change::Added => "added",
+        Change::Modified => "modified",
+        Change::Deleted => "deleted",
+    }
+}
+
+/// `boxme allow <host>…` — validate and append entries to `.boxme/allow`, the
+/// non-interactive counterpart of trusting a host in the review.
+pub(crate) fn allow_hosts(hosts: &[String]) -> Result<()> {
+    for host in hosts {
+        if entry_rule(host).is_none() {
+            bail!("`{host}` is not a valid allowlist entry (use `domain.tld` or `=exact.host`)");
+        }
+    }
+    let project_dir = std::env::current_dir()?;
+    let merged = allowlist::save_merged(&project_dir, Scope::Packages, hosts)?;
+    eprintln!(
+        "{} {} host(s) → {}",
+        ">> allowlist:".dimmed(),
+        merged.len(),
+        allowlist::path(&project_dir, Scope::Packages).display(),
+    );
+    Ok(())
 }
 
 /// Observe the command with the network open, let the user trust hosts in the
@@ -303,7 +489,9 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
         );
     }
 
-    // The actual command, fully interactive on the host terminal.
+    // The actual command: fully interactive on the host terminal, except in
+    // --json mode, where there is no one at a TTY and stdout is reserved for
+    // the report — there it runs detached with output streamed to stderr.
     eprintln!("{} {command_line}\n", ">> running:".dimmed());
     let npm_env = npm_platform_export(tool, &ctx.env);
     let guest_cmd = format!(
@@ -311,9 +499,12 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
         scripts::RAISE_FDS,
         quote_args(args)
     );
-    let exit_code = sb
-        .attach_with("bash", |a| a.args(["-lc", &guest_cmd]))
-        .await?;
+    let exit_code = if ctx.cli.json {
+        stream_shell_stderr(sb, &guest_cmd).await?
+    } else {
+        sb.attach_with("bash", |a| a.args(["-lc", &guest_cmd]))
+            .await?
+    };
 
     // Stop capture, parse contacts.
     let mut network_banner = None;
@@ -350,6 +541,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     };
 
     let mut files: Vec<FileItem> = Vec::new();
+    let mut dir_counts: Vec<(String, u64)> = Vec::new();
     for dir in &write_set.dirs {
         let count = shell_capture(sb, &scripts::count_files(dir))
             .await
@@ -357,6 +549,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
         if count > 0 {
+            dir_counts.push((dir.to_string(), count));
             files.push(FileItem {
                 label: format!("{dir}/: {count} files"),
                 kind: FileKind::ExpectedSummary,
@@ -415,6 +608,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
         changes,
         expected_files,
         unexpected,
+        dir_counts,
     })
 }
 
