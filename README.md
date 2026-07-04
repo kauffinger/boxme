@@ -305,6 +305,30 @@ package-manager `.boxme/allow` so the two surfaces can't inherit each other's
 reachability); later runs enforce it. `--strict` drops the extras — API host and
 registries only.
 
+## Claude Code skills: sweeping many repos
+
+`boxme skills` installs two Claude Code skills into `~/.claude/skills` (they're
+bundled in the binary, so it works offline and tracks your installed version):
+
+```sh
+boxme skills
+```
+
+- **fleet-update** — say *"update all repos in ~/Code for me"*: Claude runs
+  `composer update` / `npm update` through `boxme --json` in every repo in the
+  folder, applies the clean results, and hands you a per-repo report of anything
+  that needs a human look.
+- **fleet-fix** — say *"fix the vulnerable deps in ~/Code"*: a security-only pass
+  with minimal churn — `composer fix` (the [innobrain/composer-fix] plugin baked
+  into the sandbox image) and `npm audit fix`, non-breaking fixes only. Anything
+  that would need a constraint or major bump is reported, never forced.
+
+Both skills inherit boxme's guarantees: every install runs sandboxed, and a
+changeset whose report shows unexpected files, out-of-workspace writes, or
+blocked hosts is left staged for your review instead of being applied.
+
+[innobrain/composer-fix]: https://packagist.org/packages/innobrain/composer-fix
+
 ## Deciding what the network can reach
 
 A run is one of two things: **observe** or **enforce**. UDP is always blocked

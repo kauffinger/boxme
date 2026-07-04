@@ -14,6 +14,7 @@ mod review;
 mod run;
 mod scripts;
 mod setup;
+mod skills;
 mod util;
 
 use clap::Parser;
@@ -33,6 +34,7 @@ async fn main() {
         cli::Command::Logout => auth::logout().map(|()| 0),
         cli::Command::Apply => report::apply(parsed.json).map(|()| 0),
         cli::Command::Discard => report::discard(parsed.json).map(|()| 0),
+        cli::Command::Skills => skills::install().map(|()| 0),
         cli::Command::Allow { hosts } => run::allow_hosts(hosts).map(|()| 0),
         cli::Command::Run(args) => run::run(&parsed, args).await,
     };

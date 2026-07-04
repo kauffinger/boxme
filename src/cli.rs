@@ -135,6 +135,11 @@ pub enum Command {
     /// applying it.
     Discard,
 
+    /// Install the bundled Claude Code skills (fleet-update, fleet-fix) into
+    /// `~/.claude/skills`, so any Claude session can sweep a whole folder of
+    /// repos through boxme — "update all repos in ~/Code for me".
+    Skills,
+
     /// Add host(s) to the package-run allowlist (`.boxme/allow`) without the
     /// review TUI — the non-interactive counterpart of trusting a host in the
     /// review. A bare host matches the domain and all subdomains; prefix with

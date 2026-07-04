@@ -36,6 +36,7 @@ boxme --json composer i     # non-interactive: JSON report on stdout, changeset 
 boxme apply                 # copy the staged changeset into the project (second step of the --json flow)
 boxme discard               # drop the staged changeset instead
 boxme allow foo.com         # add allowlist host(s) without the TUI (=exact.host for exact-only)
+boxme skills                # install the bundled fleet-update/fleet-fix Claude Code skills to ~/.claude/skills
 ```
 
 ## Releasing
@@ -68,7 +69,7 @@ msb_krun is otherwise pure Rust, so there is no libkrun system package.
 
 Tests are pure unit tests in `#[cfg(test)] mod tests` blocks (in `netcap.rs`,
 `allowlist.rs`, `manifest.rs`, `outside.rs`, `review.rs`, `report.rs`,
-`copyback.rs`). There is no
+`copyback.rs`, `skills.rs`). There is no
 integration-test harness — anything touching the sandbox is exercised by running
 `boxme` against a real project. There is no rustfmt/clippy config and no
 toolchain pin; default stable applies.
@@ -344,6 +345,13 @@ assumption; verify these on a real `boxme dev` run.
   `logout` removes it, `load` is the read path `resolve_claude_env` falls back to.
   The token is read only at boot and injected into the *guest* env, never the host
   shell.
+- `skills.rs` — the `boxme skills` path: installs the bundled Claude Code
+  skills (fleet-update, fleet-fix) into `$CLAUDE_CONFIG_DIR/skills` or
+  `~/.claude/skills`. The SKILL.md files under `.claude/skills/` are the single
+  source of truth, compiled in via `include_str!` — edit them there and the
+  binary picks them up on the next build (a test asserts each frontmatter
+  `name` matches its install dir). A skill dir that is already a symlink (a dev
+  checkout wired up by hand) is left untouched.
 - `util.rs` — `tar_directory` (packs a project tarball for the **`dev`** path
   only — the review run mounts read-only instead; always skips the top-level
   `vendor/`/`node_modules/`, which `dev` reinstalls Linux-native in-guest and
