@@ -81,11 +81,8 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     if !matches!(tool, "composer" | "npm") {
         bail!("boxme only wraps `composer` and `npm` (got `{tool}`)");
     }
-    if cli.json && cli.learn {
-        bail!(
-            "--learn needs the interactive review; in --json mode, allow blocked \
-             hosts from the report with `boxme allow <host>` and re-run"
-        );
+    if let Some(conflict) = conflicting_flags(cli) {
+        bail!("{conflict}");
     }
     // The review TUI and the attached command both need a terminal — without
     // one, point at the non-interactive flow instead of hanging or garbling.
@@ -163,6 +160,24 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
         enforced_run(&ctx, allow, can_trust).await?;
     }
     Ok(0)
+}
+
+/// Flag combinations that contradict each other, rejected up front — before
+/// anything boots. Used by the package path and `boxme claude` alike.
+pub(crate) fn conflicting_flags(cli: &Cli) -> Option<&'static str> {
+    if cli.strict && cli.learn {
+        return Some(
+            "--strict contradicts --learn: learning runs the command with the network \
+             open to observe it, strict promises registries-only — drop one of them",
+        );
+    }
+    if cli.json && cli.learn {
+        return Some(
+            "--learn needs the interactive review; in --json mode, allow blocked \
+             hosts from the report with `boxme allow <host>` and re-run",
+        );
+    }
+    None
 }
 
 /// Non-interactive run: enforce, run the command (output streamed to stderr —
@@ -506,28 +521,25 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
             .await?
     };
 
-    // Stop capture, parse contacts.
-    let mut network_banner = None;
-    let network = match capture {
+    // Stop capture, parse contacts. A capture found dead at stop time (a guest
+    // process killed tcpdump mid-run) or an unreadable pcap raises a review
+    // banner — the contact list must not read as complete when it isn't.
+    let (network, network_banner) = match capture {
         Some(cap) => {
-            cap.stop().await;
+            let died_early = cap.stop().await;
             match netcap::contacts(sb).await {
-                Ok(contacts) => contacts,
-                Err(_) => {
-                    network_banner =
-                        Some("network capture unreadable — contacts unknown".to_string());
-                    Vec::new()
-                }
+                Ok(contacts) => (contacts, netcap::capture_banner(died_early, false)),
+                Err(_) => (Vec::new(), netcap::capture_banner(died_early, true)),
             }
         }
-        None => {
-            network_banner = Some(
+        None => (
+            Vec::new(),
+            Some(
                 "network capture unavailable (no tcpdump in base image) — \
                  run `boxme setup --force` to enable it"
                     .to_string(),
-            );
-            Vec::new()
-        }
+            ),
+        ),
     };
 
     // Manifest after + diff, partitioned expected vs unexpected.
@@ -1040,6 +1052,24 @@ fn entry_rule(entry: &str) -> Option<Rule> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn strict_and_learn_are_rejected_together() {
+        let parse = |args: &[&str]| Cli::parse_from(args);
+        assert!(
+            conflicting_flags(&parse(&["boxme", "--strict", "--learn", "composer", "i"])).is_some(),
+            "--strict --learn would run with the network open"
+        );
+        assert!(
+            conflicting_flags(&parse(&["boxme", "--json", "--learn", "composer", "i"])).is_some()
+        );
+        assert!(conflicting_flags(&parse(&["boxme", "--strict", "composer", "i"])).is_none());
+        assert!(conflicting_flags(&parse(&["boxme", "--learn", "composer", "i"])).is_none());
+        assert!(
+            conflicting_flags(&parse(&["boxme", "--strict", "--json", "composer", "i"])).is_none()
+        );
+    }
 
     fn contact(domain: Option<&str>, known: bool) -> NetworkContact {
         NetworkContact {

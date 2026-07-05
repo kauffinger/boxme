@@ -139,19 +139,29 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write a staged changeset into `base` (an already-canonical dir): replace the
-/// expected dirs wholesale, unpack the tarball, then apply deletions. Does *not*
-/// remove the source tarball — the caller drops it only once the whole operation
-/// has succeeded. Every target is confined to `base` (tarball content is
-/// sandbox-controlled).
+/// Write a staged changeset into `base` (an already-canonical dir). The tarball
+/// is extracted into a scratch dir inside `base` first and only then swapped
+/// into place, so a corrupt tarball or a full disk fails *before* anything in
+/// the project is removed — the destructive steps are same-filesystem renames,
+/// the operations least likely to fail part-way. Does *not* remove the source
+/// tarball — the caller drops it only once the whole operation has succeeded.
+/// Every target is confined to `base` (tarball content is sandbox-controlled).
 fn apply_staged(base: &Path, staged: &Staged) -> Result<()> {
     if let Some(host_tgz) = &staged.tgz {
-        for dir in &staged.replace_dirs {
-            if let Some(target) = contained_target(base, dir)? {
-                remove_contained(&target)?;
+        let scratch = base.join(format!(".boxme-apply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch)
+            .with_context(|| format!("creating {} failed", scratch.display()))?;
+        let swapped = extract(host_tgz, &scratch).and_then(|()| {
+            for dir in &staged.replace_dirs {
+                if let Some(target) = contained_target(base, dir)? {
+                    remove_contained(&target)?;
+                }
             }
-        }
-        extract(host_tgz, base)?;
+            merge_into(&scratch, base)
+        });
+        let _ = std::fs::remove_dir_all(&scratch);
+        swapped?;
     }
     for path in &staged.deletions {
         if let Some(target) = contained_target(base, path)? {
@@ -159,6 +169,44 @@ fn apply_staged(base: &Path, staged: &Staged) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Move everything under `src` into `dst`, merging directories and replacing
+/// anything else in the way. `src` lives inside `dst`'s filesystem, so every
+/// entry lands via rename.
+fn merge_into(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        // file_type() doesn't follow symlinks, so a symlink moves as itself; a
+        // symlink in the way is likewise unlinked, never written through.
+        let both_dirs = entry.file_type()?.is_dir()
+            && std::fs::symlink_metadata(&to)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+        if both_dirs {
+            merge_into(&from, &to)?;
+        } else {
+            remove_contained(&to)?;
+            std::fs::rename(&from, &to)
+                .with_context(|| format!("moving {} into place failed", to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// A failed apply must not read as lost work: the tarball survives (it is only
+/// removed on success), so say where it is and how to apply it by hand.
+fn recovery_context(err: anyhow::Error, staged: &Staged) -> anyhow::Error {
+    match &staged.tgz {
+        Some(tgz) => err.context(format!(
+            "apply failed part-way — the changeset tarball survives at {0}; \
+             `tar xzf {0} -C .` applies it by hand",
+            tgz.display()
+        )),
+        None => err,
+    }
 }
 
 /// Apply a staged changeset to the project in place: replace the expected dirs
@@ -171,7 +219,7 @@ pub fn commit(project_dir: &Path, staged: Staged) -> Result<()> {
     let base = project_dir
         .canonicalize()
         .with_context(|| format!("canonicalizing {} failed", project_dir.display()))?;
-    apply_staged(&base, &staged)?;
+    apply_staged(&base, &staged).map_err(|e| recovery_context(e, &staged))?;
     if let Some(host_tgz) = &staged.tgz {
         let _ = std::fs::remove_file(host_tgz);
     }
@@ -250,7 +298,7 @@ pub fn commit_to_branch(
     // recovery.
     let _ = git(&base, &["worktree", "remove", "--force", &wt]);
     let _ = std::fs::remove_dir_all(&worktree);
-    result?;
+    result.map_err(|e| recovery_context(e, &staged))?;
     if let Some(host_tgz) = &staged.tgz {
         let _ = std::fs::remove_file(host_tgz);
     }
@@ -378,7 +426,9 @@ fn contained_target(base: &Path, rel: &str) -> Result<Option<PathBuf>> {
 }
 
 /// Unpack with explicit rejection of absolute paths and `..` components on top
-/// of `unpack_in`'s own containment.
+/// of `unpack_in`'s own containment. Link entries are guest-authored too: their
+/// *target* is validated as well, so copy-back can't plant a symlink pointing
+/// outside the project dir (e.g. `innocuous.txt -> /Users/you/.ssh/id_rsa`).
 fn extract(tgz: &Path, dest: &Path) -> Result<()> {
     let file = std::fs::File::open(tgz)?;
     let decoder = flate2::read::GzDecoder::new(file);
@@ -394,9 +444,56 @@ fn extract(tgz: &Path, dest: &Path) -> Result<()> {
         {
             bail!("tarball entry escapes the project dir: {}", path.display());
         }
+        if let Some(target) = entry.link_name()? {
+            let escapes = if entry.header().entry_type().is_symlink() {
+                symlink_target_escapes(&path, &target)
+            } else {
+                // Hardlink targets are archive-root-relative; nothing
+                // legitimate in a changeset needs `..` there.
+                target.is_absolute()
+                    || target
+                        .components()
+                        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+            };
+            if escapes {
+                bail!(
+                    "tarball link entry escapes the project dir: {} -> {}",
+                    path.display(),
+                    target.display()
+                );
+            }
+        }
         entry.unpack_in(dest)?;
     }
     Ok(())
+}
+
+/// Whether a symlink target, resolved against the linking entry's parent, can
+/// land outside the archive root. Relative targets may climb with *leading*
+/// `..` components — npm's `node_modules/.bin/x -> ../pkg/bin/x` links depend
+/// on it — but never past the root. Absolute targets and any `..` after a
+/// normal component are rejected outright: the crossed component could itself
+/// be a symlink, which would defeat a purely lexical depth count.
+fn symlink_target_escapes(entry_path: &Path, target: &Path) -> bool {
+    let parent_depth = entry_path
+        .parent()
+        .map(|p| {
+            p.components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count()
+        })
+        .unwrap_or(0);
+    let mut leading_parents = 0usize;
+    let mut seen_normal = false;
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => seen_normal = true,
+            Component::CurDir => {}
+            Component::ParentDir if !seen_normal => leading_parents += 1,
+            _ => return true,
+        }
+    }
+    leading_parents > parent_depth
 }
 
 /// Join a sandbox-supplied relative path onto the project dir, refusing
@@ -472,5 +569,224 @@ mod tests {
         assert_eq!(loaded.deletions, vec!["old.txt"]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gzipped tarball with the given regular files (path, contents).
+    fn file_tarball(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+        let tgz = dir.join("changeset.tgz");
+        let file = std::fs::File::create(&tgz).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, contents.as_bytes())
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+        tgz
+    }
+
+    /// Fresh temp project dir seeded with (path, contents) files.
+    fn seeded_project(root: &Path, files: &[(&str, &str)]) -> PathBuf {
+        let project = root.join("project");
+        for (path, contents) in files {
+            let target = project.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, contents).unwrap();
+        }
+        project
+    }
+
+    #[test]
+    fn commit_replaces_dirs_wholesale_and_merges_files() {
+        let dir = std::env::temp_dir().join(format!("boxme-commit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = seeded_project(
+            &dir,
+            &[
+                ("vendor/stale.txt", "stale"),
+                ("app/Existing.php", "keep me"),
+                ("old.txt", "delete me"),
+            ],
+        );
+        let tgz = file_tarball(
+            &dir,
+            &[
+                ("vendor/new.txt", "new"),
+                ("composer.lock", "lock"),
+                ("app/New.php", "<?php"),
+            ],
+        );
+
+        let staged = Staged {
+            tgz: Some(tgz.clone()),
+            replace_dirs: vec!["vendor".to_string()],
+            deletions: vec!["old.txt".to_string()],
+        };
+        commit(&project, staged).unwrap();
+
+        assert!(
+            !project.join("vendor/stale.txt").exists(),
+            "replace_dirs are swapped wholesale, not merged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("vendor/new.txt")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("composer.lock")).unwrap(),
+            "lock"
+        );
+        assert!(project.join("app/New.php").exists());
+        assert_eq!(
+            std::fs::read_to_string(project.join("app/Existing.php")).unwrap(),
+            "keep me",
+            "non-replaced dirs are merged, not replaced"
+        );
+        assert!(!project.join("old.txt").exists());
+        assert!(!tgz.exists(), "tarball is dropped on success");
+        let leftovers: Vec<_> = std::fs::read_dir(&project)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".boxme-apply-")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "scratch dir must not survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_commit_leaves_the_project_untouched_and_points_at_the_tarball() {
+        let dir =
+            std::env::temp_dir().join(format!("boxme-commit-fail-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = seeded_project(&dir, &[("vendor/stale.txt", "stale")]);
+        let tgz = dir.join("changeset.tgz");
+        std::fs::write(&tgz, b"not a tarball").unwrap();
+
+        let staged = Staged {
+            tgz: Some(tgz.clone()),
+            replace_dirs: vec!["vendor".to_string()],
+            deletions: Vec::new(),
+        };
+        let err = commit(&project, staged).unwrap_err();
+
+        assert!(
+            project.join("vendor/stale.txt").exists(),
+            "nothing may be removed before the tarball proved extractable"
+        );
+        assert!(tgz.exists(), "the tarball survives for recovery");
+        assert!(
+            format!("{err:#}").contains(&tgz.display().to_string()),
+            "the error must point at the surviving tarball, got: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gzipped tarball holding one regular file plus the given link entries.
+    fn link_tarball(dir: &Path, links: &[(tar::EntryType, &str, &str)]) -> PathBuf {
+        let tgz = dir.join("changeset.tgz");
+        let file = std::fs::File::create(&tgz).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "regular.txt", &b"hello"[..])
+            .unwrap();
+
+        for (kind, path, target) in links {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*kind);
+            header.set_size(0);
+            builder.append_link(&mut header, path, target).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+        tgz
+    }
+
+    fn extract_links(name: &str, links: &[(tar::EntryType, &str, &str)]) -> Result<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("boxme-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tgz = link_tarball(&dir, links);
+        let dest = dir.join("project");
+        std::fs::create_dir_all(&dest).unwrap();
+        extract(&tgz, &dest).map(|()| dest)
+    }
+
+    #[test]
+    fn extract_rejects_symlink_with_absolute_target() {
+        let err = extract_links(
+            "abs-symlink",
+            &[(tar::EntryType::Symlink, "innocuous.txt", "/etc/passwd")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("escapes the project dir"));
+    }
+
+    #[test]
+    fn extract_rejects_symlink_climbing_out_of_the_root() {
+        let err = extract_links(
+            "climb-symlink",
+            &[(tar::EntryType::Symlink, "sub/link.txt", "../../outside")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("escapes the project dir"));
+    }
+
+    #[test]
+    fn extract_rejects_parent_component_after_a_normal_one() {
+        // `dir/..` looks contained lexically but `dir` could be a symlink.
+        let err = extract_links(
+            "mixed-symlink",
+            &[(tar::EntryType::Symlink, "sub/link.txt", "other/../file")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("escapes the project dir"));
+    }
+
+    #[test]
+    fn extract_rejects_hardlink_with_parent_component() {
+        let err = extract_links(
+            "hardlink",
+            &[(tar::EntryType::Link, "sub/link.txt", "../outside")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("escapes the project dir"));
+    }
+
+    #[test]
+    fn extract_allows_npm_bin_style_relative_symlink() {
+        let dest = extract_links(
+            "bin-symlink",
+            &[(
+                tar::EntryType::Symlink,
+                "node_modules/.bin/tsc",
+                "../typescript/bin/tsc",
+            )],
+        )
+        .unwrap();
+        let link = dest.join("node_modules/.bin/tsc");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("../typescript/bin/tsc")
+        );
+        let _ = std::fs::remove_dir_all(dest.parent().unwrap());
     }
 }

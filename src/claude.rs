@@ -31,7 +31,8 @@ use crate::detect;
 use crate::manifest::{self, Change};
 use crate::netcap::{self, NetworkContact};
 use crate::run::{
-    claude_policy, cleanup, ensure_cache_volumes, observe_policy, resolve_env, vm_name,
+    claude_policy, cleanup, conflicting_flags, ensure_cache_volumes, observe_policy, resolve_env,
+    vm_name,
 };
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
@@ -43,7 +44,10 @@ const AUTH_VARS: [&str; 2] = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
 
 /// Everything the in-guest run produced that teardown + copy-out need.
 struct ClaudeRun {
-    staged: copyback::Staged,
+    /// What to stage out of the guest — built from the manifest diff. Staging
+    /// happens in `claude`, not `run_in_guest`, so a copy-out failure can keep
+    /// the VM alive instead of tearing it down with the agent's work inside.
+    plan: CopyPlan,
     contacts: Vec<NetworkContact>,
     change_count: usize,
     /// Every path in the manifest diff (changed or deleted) — used host-side to
@@ -58,6 +62,9 @@ pub async fn claude(cli: &Cli, prompt_parts: &[String]) -> Result<()> {
             "--json isn't supported for `boxme claude` yet — a headless run \
              (`boxme claude 'prompt'`) is already non-interactive"
         );
+    }
+    if let Some(conflict) = conflicting_flags(cli) {
+        bail!("{conflict}");
     }
     if !base_snapshot_exists().await? {
         bail!("base snapshot missing — run `boxme setup` first");
@@ -90,18 +97,26 @@ pub async fn claude(cli: &Cli, prompt_parts: &[String]) -> Result<()> {
     let name = vm_name(&project_dir);
     let sb = boot(cli, &project_dir, policy, &env, &secrets, &name).await?;
 
-    let outcome = run_in_guest(
-        &sb,
-        &project_dir,
-        prompt.as_deref(),
-        &php,
-        node,
-        has_composer,
-    )
-    .await;
+    let run = match run_in_guest(&sb, prompt.as_deref(), &php, node, has_composer).await {
+        Ok(run) => run,
+        Err(e) => {
+            cleanup(cli, sb, &name).await;
+            return Err(e);
+        }
+    };
 
+    // The agent's work exists only in the guest upper until it is staged out —
+    // a failed copy-out keeps the VM alive instead of tearing it down with the
+    // whole session inside.
+    let staged = match copyback::stage(&sb, &project_dir, &run.plan).await {
+        Ok(staged) => staged,
+        Err(e) => {
+            eprintln!("{}", stage_failure_notice(&name).red());
+            sb.detach().await;
+            return Err(e);
+        }
+    };
     cleanup(cli, sb, &name).await;
-    let run = outcome?;
 
     report_contacts(&run.contacts);
     if cli.learn {
@@ -122,7 +137,17 @@ pub async fn claude(cli: &Cli, prompt_parts: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    deliver(&project_dir, prompt.as_deref(), run)
+    deliver(&project_dir, prompt.as_deref(), &run, staged)
+}
+
+/// Printed when staging the changeset out of the guest fails: the VM is kept
+/// running (even without `--keep`) so the agent's work survives the error.
+fn stage_failure_notice(vm: &str) -> String {
+    format!(
+        "copy-out failed — keeping VM '{vm}' running so the agent's work isn't lost. \
+         its changes are still in the guest at /workspace; fix the cause (disk space?) \
+         and pull anything you need out before removing the VM"
+    )
 }
 
 /// Copy the agent's changeset out to the host. The default is an in-place apply
@@ -131,7 +156,12 @@ pub async fn claude(cli: &Cli, prompt_parts: &[String]) -> Result<()> {
 /// would clobber their work, so boxme asks (interactive) or falls back to a
 /// branch (headless). `headless` is true for a `-p` run, where there's no TTY to
 /// prompt on.
-fn deliver(project_dir: &Path, prompt: Option<&str>, run: ClaudeRun) -> Result<()> {
+fn deliver(
+    project_dir: &Path,
+    prompt: Option<&str>,
+    run: &ClaudeRun,
+    staged: copyback::Staged,
+) -> Result<()> {
     let headless = prompt.is_some();
     let message = match prompt {
         Some(p) => format!("boxme claude: {p}"),
@@ -149,7 +179,7 @@ fn deliver(project_dir: &Path, prompt: Option<&str>, run: ClaudeRun) -> Result<(
             CollisionChoice::Overwrite => false,
             CollisionChoice::Branch => true,
             CollisionChoice::Abort => {
-                report_aborted(run.staged.tarball());
+                report_aborted(staged.tarball());
                 return Ok(());
             }
         }
@@ -157,7 +187,7 @@ fn deliver(project_dir: &Path, prompt: Option<&str>, run: ClaudeRun) -> Result<(
 
     if to_branch {
         let branch = format!("boxme/claude-{}", epoch_secs());
-        match copyback::commit_to_branch(project_dir, run.staged, &message, &branch)? {
+        match copyback::commit_to_branch(project_dir, staged, &message, &branch)? {
             Some(branch) => {
                 eprintln!(
                     "{}",
@@ -176,7 +206,7 @@ fn deliver(project_dir: &Path, prompt: Option<&str>, run: ClaudeRun) -> Result<(
             None => eprintln!("{}", "nothing to commit".dimmed()),
         }
     } else {
-        copyback::commit(project_dir, run.staged)?;
+        copyback::commit(project_dir, staged)?;
         eprintln!(
             "{}",
             format!(
@@ -265,11 +295,10 @@ fn report_aborted(tarball: Option<&Path>) {
 }
 
 /// Mount the project, match toolchain versions, run claude attached, then diff
-/// the manifest and stage the agent's changeset out of the guest. Does not tear
-/// the VM down or commit — the caller does both, in that order.
+/// the manifest into a copy plan. Does not stage, tear the VM down, or commit —
+/// the caller does all three, in that order.
 async fn run_in_guest(
     sb: &Sandbox,
-    project_dir: &Path,
     prompt: Option<&str>,
     php: &str,
     node: Option<u32>,
@@ -323,8 +352,12 @@ async fn run_in_guest(
 
     let contacts = match capture {
         Some(cap) => {
-            cap.stop().await;
-            netcap::contacts(sb).await.unwrap_or_default()
+            let died_early = cap.stop().await;
+            let parsed = netcap::contacts(sb).await;
+            if let Some(banner) = netcap::capture_banner(died_early, parsed.is_err()) {
+                eprintln!("{}", format!("warning: {banner}").yellow());
+            }
+            parsed.unwrap_or_default()
         }
         None => Vec::new(),
     };
@@ -349,10 +382,9 @@ async fn run_in_guest(
             .collect(),
     };
     let changed_paths: Vec<String> = changes.iter().map(|(p, _)| p.clone()).collect();
-    let staged = copyback::stage(sb, project_dir, &plan).await?;
 
     Ok(ClaudeRun {
-        staged,
+        plan,
         contacts,
         change_count: changes.len(),
         changed_paths,
@@ -511,4 +543,16 @@ fn epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_failure_notice_says_where_the_surviving_work_lives() {
+        let notice = stage_failure_notice("boxme-app-1a2b");
+        assert!(notice.contains("boxme-app-1a2b"), "must name the kept VM");
+        assert!(notice.contains("/workspace"), "must say where the work is");
+    }
 }

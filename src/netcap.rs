@@ -61,6 +61,7 @@ impl NetworkContact {
 pub struct Capture {
     control: ExecControl,
     task: JoinHandle<()>,
+    exited: Arc<AtomicBool>,
 }
 
 /// Start tcpdump in the guest and give it a moment to come up. `None` means
@@ -89,15 +90,41 @@ pub async fn start(sb: &Sandbox) -> Option<Capture> {
     if exited.load(Ordering::SeqCst) {
         return None;
     }
-    Some(Capture { control, task })
+    Some(Capture {
+        control,
+        task,
+        exited,
+    })
 }
 
 impl Capture {
     /// SIGTERM tcpdump (flushes the pcap thanks to -U) and wait for the drain
-    /// task to finish, bounded so a stuck guest can't hang the run.
-    pub async fn stop(self) {
+    /// task to finish, bounded so a stuck guest can't hang the run. Returns
+    /// whether tcpdump was already dead *before* we asked it to stop — i.e.
+    /// something in the guest killed it mid-run and the capture is truncated.
+    pub async fn stop(self) -> bool {
+        let died_early = self.exited.load(Ordering::SeqCst);
         let _ = self.control.signal(15).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.task).await;
+        died_early
+    }
+}
+
+/// Review banner for a finished capture; `None` when it ran to the end and was
+/// readable. A capture that died mid-run (e.g. a guest `pkill tcpdump`) outranks
+/// an unreadable one: everything after the kill went unrecorded, so presenting
+/// the contact list as complete would make an exfiltrating run look clean.
+pub fn capture_banner(died_early: bool, unreadable: bool) -> Option<String> {
+    if died_early {
+        Some(
+            "network capture died during the run — later contacts were not recorded; \
+             treat this run as suspect"
+                .to_string(),
+        )
+    } else if unreadable {
+        Some("network capture unreadable — contacts unknown".to_string())
+    } else {
+        None
     }
 }
 
@@ -136,6 +163,12 @@ fn parse_tcpdump_text(text: &str) -> Vec<NetworkContact> {
 
         // DNS answer: "... > 10.0.2.15.51234: 12345 2/0/0 CNAME x., A 1.2.3.4 (60)"
         if tokens.iter().any(|t| is_answer_counts(t)) {
+            // Only trust answers actually sourced from the slirp resolver: a
+            // guest process can craft a packet with a matching txn id to alias
+            // its exfil IP to a known registry domain in the review.
+            if !from_resolver(&tokens) {
+                continue;
+            }
             let Some(id) = txn_id(&tokens) else { continue };
             let Some(name) = queries.get(&id).cloned() else {
                 continue;
@@ -182,6 +215,19 @@ fn parse_tcpdump_text(text: &str) -> Vec<NetworkContact> {
             }
         })
         .collect()
+}
+
+/// The slirp DNS resolver every guest query goes to; the only source DNS
+/// answers may be joined from.
+const RESOLVER: (&str, u16) = ("10.0.2.3", 53);
+
+/// Whether the packet's source (the token before ">") is the slirp resolver.
+fn from_resolver(tokens: &[&str]) -> bool {
+    let Some(gt) = tokens.iter().position(|t| *t == ">") else {
+        return false;
+    };
+    gt > 0
+        && split_ip_port(tokens[gt - 1]).is_some_and(|(ip, port)| (ip.as_str(), port) == RESOLVER)
 }
 
 /// The DNS transaction id is the first token after the `dst:` token — strip
@@ -243,5 +289,35 @@ mod tests {
         let unknown = contacts.iter().find(|c| c.ip == "6.6.6.6").unwrap();
         assert!(unknown.domain.is_none());
         assert!(!unknown.known);
+    }
+
+    #[test]
+    fn capture_banner_flags_a_mid_run_death_over_everything() {
+        assert_eq!(capture_banner(false, false), None);
+        assert!(capture_banner(false, true).unwrap().contains("unreadable"));
+        assert!(capture_banner(true, false)
+            .unwrap()
+            .contains("died during the run"));
+        // A dead capture is the louder signal — it wins over unreadability.
+        assert!(capture_banner(true, true)
+            .unwrap()
+            .contains("died during the run"));
+    }
+
+    #[test]
+    fn ignores_dns_answer_not_sourced_from_the_resolver() {
+        // A guest process self-sends a forged answer with the query's txn id,
+        // claiming github.com resolves to its exfil IP, then connects there.
+        let text = "\
+12:00:00.000000 eth0 Out IP 10.0.2.15.51234 > 10.0.2.3.53: 12345+ A? github.com. (28)
+12:00:00.005000 eth0 In  IP 10.0.2.15.5353 > 10.0.2.15.51234: 12345 1/0/0 A 6.6.6.6 (44)
+12:00:00.020000 eth0 Out IP 10.0.2.15.40000 > 6.6.6.6.443: Flags [S], seq 1, win 64240, length 0
+";
+        let contacts = parse_tcpdump_text(text);
+        assert_eq!(contacts.len(), 1);
+        let contact = &contacts[0];
+        assert_eq!(contact.ip, "6.6.6.6");
+        assert!(contact.domain.is_none(), "forged answer must not be joined");
+        assert!(!contact.known);
     }
 }

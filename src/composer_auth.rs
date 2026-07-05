@@ -139,26 +139,30 @@ fn build(mut value: serde_json::Value) -> Option<ComposerAuth> {
         }
     }
 
-    // http-basic: `{ host: { username, password } }`. Only the password is a
-    // secret; the username (often an email) is left as-is, since composer needs
-    // it to form the Basic-auth pair and it is not a credential on its own.
+    // http-basic: `{ host: { username, password } }`. Both fields become
+    // placeholders: the username is often just an email, but a common pattern
+    // (GitHub PAT over HTTPS, Private Packagist, Satis) puts the real token in
+    // `username` with a dummy password — treating only `password` as the secret
+    // would serialize that token verbatim into the guest env.
     if let Some(map) = obj.get_mut("http-basic").and_then(|v| v.as_object_mut()) {
         for (host, creds) in map.iter_mut() {
             let host = host.clone();
-            let Some(password) = creds.get_mut("password") else {
-                continue;
-            };
-            let Some(real) = password.as_str() else {
-                continue;
-            };
-            let idx = secrets.len();
-            secrets.push(secret(
-                idx,
-                real.to_string(),
-                allowed_hosts(&host, false),
-                SecretInjection::default(),
-            ));
-            *password = serde_json::Value::String(placeholder(idx));
+            for field in ["username", "password"] {
+                let Some(value) = creds.get_mut(field) else {
+                    continue;
+                };
+                let Some(real) = value.as_str() else {
+                    continue;
+                };
+                let idx = secrets.len();
+                secrets.push(secret(
+                    idx,
+                    real.to_string(),
+                    allowed_hosts(&host, false),
+                    SecretInjection::default(),
+                ));
+                *value = serde_json::Value::String(placeholder(idx));
+            }
         }
     }
 
@@ -223,25 +227,47 @@ mod tests {
     }
 
     #[test]
-    fn http_basic_password_becomes_placeholder_username_kept() {
+    fn http_basic_username_and_password_both_become_placeholders() {
         let auth = built(
             r#"{"http-basic":{"composer.fluxui.dev":{"username":"me@x.de","password":"hunter2"}}}"#,
         );
-        // The real value never lands in COMPOSER_AUTH; the username does.
+        // Neither field lands in COMPOSER_AUTH verbatim.
         assert!(!auth.env.1.contains("hunter2"));
-        assert!(auth.env.1.contains("me@x.de"));
+        assert!(!auth.env.1.contains("me@x.de"));
         assert!(auth.env.1.contains("__BOXME_COMPOSER_SECRET_0__"));
+        assert!(auth.env.1.contains("__BOXME_COMPOSER_SECRET_1__"));
 
-        assert_eq!(auth.secrets.len(), 1);
-        let s = &auth.secrets[0];
-        assert_eq!(s.value, "hunter2");
-        assert_eq!(s.placeholder, "__BOXME_COMPOSER_SECRET_0__");
+        assert_eq!(auth.secrets.len(), 2);
+        let username = &auth.secrets[0];
+        assert_eq!(username.value, "me@x.de");
+        let password = &auth.secrets[1];
+        assert_eq!(password.value, "hunter2");
+        for s in &auth.secrets {
+            assert_eq!(
+                s.allowed_hosts,
+                vec![HostPattern::Wildcard("*.composer.fluxui.dev".to_string())]
+            );
+            assert!(s.injection.basic_auth);
+            assert!(s.require_tls_identity);
+        }
+    }
+
+    #[test]
+    fn http_basic_token_as_username_never_reaches_the_guest() {
+        // PAT-over-HTTPS shape: the real credential rides in `username`.
+        let auth = built(
+            r#"{"http-basic":{"repo.packagist.com":{"username":"packagist-token-xyz","password":"x-oauth-basic"}}}"#,
+        );
+        assert!(!auth.env.1.contains("packagist-token-xyz"));
+        let s = auth
+            .secrets
+            .iter()
+            .find(|s| s.value == "packagist-token-xyz")
+            .expect("username registered as a secret");
         assert_eq!(
             s.allowed_hosts,
-            vec![HostPattern::Wildcard("*.composer.fluxui.dev".to_string())]
+            vec![HostPattern::Wildcard("*.repo.packagist.com".to_string())]
         );
-        assert!(s.injection.basic_auth);
-        assert!(s.require_tls_identity);
     }
 
     #[test]
@@ -267,12 +293,12 @@ mod tests {
             r#"{
                 "github-oauth":{"github.com":"tok"},
                 "http-basic":{
-                    "a.example.com":{"username":"u","password":"p1"},
-                    "b.example.com":{"username":"u","password":"p2"}
+                    "a.example.com":{"username":"alice@x.de","password":"p1"},
+                    "b.example.com":{"username":"bob@x.de","password":"p2"}
                 }
             }"#,
         );
-        assert_eq!(auth.secrets.len(), 3);
+        assert_eq!(auth.secrets.len(), 5);
         let mut placeholders: Vec<&str> = auth
             .secrets
             .iter()
@@ -280,7 +306,7 @@ mod tests {
             .collect();
         placeholders.sort();
         placeholders.dedup();
-        assert_eq!(placeholders.len(), 3, "placeholders must be unique");
+        assert_eq!(placeholders.len(), 5, "placeholders must be unique");
         for s in &auth.secrets {
             assert!(!auth.env.1.contains(&s.value));
             assert!(auth.env.1.contains(&s.placeholder));
