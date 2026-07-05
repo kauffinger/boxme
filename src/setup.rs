@@ -7,7 +7,7 @@ use crate::util::stream_shell_stderr;
 
 /// Snapshot every boxme run boots from. Built once, reused for fast boots.
 pub const BASE_SNAPSHOT: &str = "boxme-base";
-const BUILDER: &str = "boxme-base-builder";
+pub(crate) const BUILDER: &str = "boxme-base-builder";
 
 pub async fn base_snapshot_exists() -> Result<bool> {
     let snapshots = Snapshot::list().await?;

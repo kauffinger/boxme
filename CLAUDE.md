@@ -37,6 +37,11 @@ boxme apply                 # copy the staged changeset into the project (second
 boxme discard               # drop the staged changeset instead
 boxme allow foo.com         # add allowlist host(s) without the TUI (=exact.host for exact-only)
 boxme skills                # install the bundled fleet-update/fleet-fix Claude Code skills to ~/.claude/skills
+
+boxme ps                    # list boxme's VMs (dev sessions, kept run/claude VMs) with status + age; --json for agents
+boxme attach                # shell into this folder's running VM (dev session or kept run); --vm NAME for any
+boxme exec git diff         # one-off command in a running VM, no TTY: split stdout/stderr, exits with its code
+boxme kill NAME... | --all  # stop + remove kept/stray VMs (only boxme's own names accepted)
 ```
 
 ## Releasing
@@ -69,7 +74,8 @@ msb_krun is otherwise pure Rust, so there is no libkrun system package.
 
 Tests are pure unit tests in `#[cfg(test)] mod tests` blocks (in `netcap.rs`,
 `allowlist.rs`, `manifest.rs`, `outside.rs`, `review.rs`, `report.rs`,
-`copyback.rs`, `skills.rs`). There is no
+`copyback.rs`, `skills.rs`, `vms.rs`, `run.rs`, `claude.rs`,
+`composer_auth.rs`). There is no
 integration-test harness — anything touching the sandbox is exercised by running
 `boxme` against a real project. There is no rustfmt/clippy config and no
 toolchain pin; default stable applies.
@@ -81,15 +87,17 @@ Note the deliberate version ceiling on `time` in `Cargo.toml`: `>=0.3.6,
 ## Architecture
 
 Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
-`dev::dev`, `dev::attach`, `claude::claude`, `auth::login`, `auth::logout`,
-`report::apply`, `report::discard`, `run::allow_hosts`, or `run::run`. `cli.rs`
-uses clap derive; `setup`, `dev`, `attach`, `claude`, `login`, `logout`,
+`dev::dev`, `vms::{attach,exec,ps,kill}`, `claude::claude`, `auth::login`,
+`auth::logout`, `report::apply`, `report::discard`, `run::allow_hosts`, or
+`run::run`. `cli.rs` uses clap derive; `setup`, `dev`, `attach`, `exec`, `ps`,
+`kill`, `claude`, `login`, `logout`,
 `apply`, `discard` and `allow` are named subcommands, and everything else falls
 into an `#[command(external_subcommand)] Run(Vec<String>)`, which is why
 `boxme composer i` works — global flags (`--strict`, `--learn`, `--keep`,
 `--composer-auth`, `--json`, `--memory`, `--cpus`, `-e`) must come *before* the
 package-manager command (and before `claude`). `run::run` returns an exit code
-(`main` propagates it) so the `--json` report can drive scripts.
+(`main` propagates it) so the `--json` report can drive scripts; `vms::exec`
+likewise returns the guest command's exit code.
 
 `run.rs` is the orchestrator and the file to read first. It validates the tool
 is `composer`/`npm`, detects versions, then chooses one of three paths (the TUI
@@ -288,15 +296,32 @@ assumption; verify these on a real `boxme dev` run.
   the dev stack attached, and one-way
   host→guest file sync via a `notify` watcher + the agent fs API. Reuses
   `run.rs`'s `pub(crate)` helpers (`resolve_env`, `ensure_cache_volumes`,
-  `cleanup`, `quote_args`, the policy builders). Never copies back. Also hosts
-  `boxme attach`: the dev VM is named deterministically per folder
-  (`dev_vm_name` = `boxme-dev-<slug>-<fnv-of-abs-path>`, *not* the random-nonce
-  `run::vm_name`), so `attach` recomputes the name, `Sandbox::get(name).connect()`s
-  to the live VM, and opens a second TTY (`attach_with`) without owning teardown.
+  `cleanup`, `quote_args`, the policy builders). Never copies back. The dev VM
+  is named deterministically per folder (`dev_vm_name` =
+  `boxme-dev-<slug>-<fnv-of-abs-path>`, *not* the random-nonce `run::vm_name`),
+  which is what lets `vms.rs` discover it with no state file.
   One dev VM per folder is enforced: `dev` refuses to boot if one is already
   `Running`. Host ports are preflighted (`resolve_free_ports`) by probing
   `127.0.0.1` — a busy port bumps to the next free one (guest side untouched), so
   parallel dev sessions across repos don't collide on 8000/5173.
+- `vms.rs` — the VM lifecycle surface: `boxme ps` / `attach` / `exec` / `kill`.
+  boxme's VMs are recognized purely by name shape (`classify`: `boxme-dev-<slug>-
+  <8 hex>` dev, `boxme-<slug>-<4 hex>` run/claude, `boxme-base-builder` setup),
+  so there is no state file and other tools' sandboxes are never touched —
+  `kill` rejects non-boxme names outright. `attach`/`exec` resolve their target
+  via `--vm NAME` or fall back to the current folder's single running VM (the
+  deterministic dev session plus any run VM carrying the folder's slug;
+  several candidates → error listing them). Both connect as a second client
+  (`SandboxHandle::connect`) and `detach()` after, never owning teardown.
+  `attach` opens a TTY (`attach_with`); `exec` is the scriptable sibling — it
+  runs one command from `/workspace` via `util::stream_shell_split` (guest
+  stdout→stdout, stderr→stderr) and returns the guest exit code, which `main`
+  propagates, so agents can inspect a kept VM (`boxme --json ps`, `boxme exec
+  git diff`). `kill` = `SandboxHandle::stop` (graceful, force-kill fallback)
+  then `remove`; `--all` sweeps every boxme VM. Kept VMs come from `--keep`
+  (`run::cleanup` prints the attach/kill commands) and from `boxme claude`'s
+  copy-out-failure path (`stage_failure_notice` does the same). Pure logic
+  (`classify`, folder matching, target picking, age formatting) is unit-tested.
 - `claude.rs` — the `boxme claude [PROMPT]` path: run Claude Code inside the
   read-only overlay (interactive under `--permission-mode auto`, headless under
   bypass), then copy its net changeset back out (`deliver`). Reuses `run.rs`'s

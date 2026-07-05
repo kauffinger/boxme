@@ -185,7 +185,9 @@ boxme attach php artisan tinker
 ```
 
 `attach` finds the session by the folder (one dev VM per folder) and connects as
-a second shell alongside the running stack — it never tears the VM down. The
+a second shell alongside the running stack — it never tears the VM down. It isn't
+dev-only: any running boxme VM works, including one kept with `--keep` (see
+[Kept VMs and housekeeping](#kept-vms-and-housekeeping)). The
 database lives in the guest, so anything stateful (creating the sqlite file,
 running migrations) happens here, in the attached shell. Equivalently, chain it
 into the dev command itself:
@@ -329,6 +331,33 @@ executed) and applied only when plainly benign; out-of-workspace writes and
 unexplained blocked hosts leave the changeset staged for your review.
 
 [innobrain/composer-fix]: https://packagist.org/packages/innobrain/composer-fix
+
+## Kept VMs and housekeeping
+
+Normally a run's VM is torn down as soon as the changeset is staged out. Pass
+`--keep` to leave it running instead — most useful when something went wrong and
+you want to poke around the guest exactly as the command left it:
+
+```sh
+boxme --json --keep composer update   # a failed run leaves the VM up for autopsy
+boxme ps                              # list boxme's VMs: name, kind, status, age
+boxme attach                          # shell into this folder's running VM
+boxme attach --vm boxme-app-3f2a      # …or any VM by name
+boxme exec composer why-not php 8.4   # one-off command, no TTY
+boxme kill boxme-app-3f2a             # stop + remove when you're done
+boxme kill --all                      # sweep every boxme VM, running or not
+```
+
+`exec` is the scriptable sibling of `attach`: guest stdout/stderr stay separate
+streams and the command's exit code becomes boxme's, so agents and scripts can
+inspect a kept VM (`boxme exec git diff`, `boxme --json ps`) without a terminal.
+Without `--vm`, both target the current folder's single running VM — the dev
+session or a kept run — and list the candidates if there's more than one.
+
+boxme never loses track of these: `boxme claude` also keeps the VM alive
+automatically if copying the agent's work out fails, and `ps`/`kill` are how you
+find and clean up anything that outlived its run. `kill` only accepts boxme's
+own VM names, so it can't remove another tool's sandbox on a typo.
 
 ## Deciding what the network can reach
 

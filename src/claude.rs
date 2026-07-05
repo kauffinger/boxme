@@ -145,8 +145,9 @@ pub async fn claude(cli: &Cli, prompt_parts: &[String]) -> Result<()> {
 fn stage_failure_notice(vm: &str) -> String {
     format!(
         "copy-out failed — keeping VM '{vm}' running so the agent's work isn't lost. \
-         its changes are still in the guest at /workspace; fix the cause (disk space?) \
-         and pull anything you need out before removing the VM"
+         its changes are still in the guest at /workspace: inspect them with \
+         `boxme attach --vm {vm}` or `boxme exec --vm {vm} git diff`, fix the cause \
+         (disk space?), and `boxme kill {vm}` when you're done"
     )
 }
 
@@ -554,5 +555,13 @@ mod tests {
         let notice = stage_failure_notice("boxme-app-1a2b");
         assert!(notice.contains("boxme-app-1a2b"), "must name the kept VM");
         assert!(notice.contains("/workspace"), "must say where the work is");
+        assert!(
+            notice.contains("boxme attach --vm boxme-app-1a2b"),
+            "must give the way back in"
+        );
+        assert!(
+            notice.contains("boxme kill boxme-app-1a2b"),
+            "must give the cleanup command"
+        );
     }
 }

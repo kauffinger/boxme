@@ -89,17 +89,66 @@ pub enum Command {
         cmd: Vec<String>,
     },
 
-    /// Open another shell — or run a one-off command — inside the running
-    /// `boxme dev` session for the current folder, e.g. `boxme attach` or
-    /// `boxme attach php artisan migrate`.
+    /// Open a shell — or run a one-off command — inside a running boxme VM:
+    /// the current folder's dev session or kept run VM, or any VM via --vm.
+    /// E.g. `boxme attach`, `boxme attach php artisan migrate`,
+    /// `boxme attach --vm boxme-app-3f2a`.
     Attach {
-        /// Command to run in the dev session. Defaults to an interactive shell.
+        /// Target VM name (see `boxme ps`). Defaults to the current folder's
+        /// single running VM.
+        #[arg(long, value_name = "NAME")]
+        vm: Option<String>,
+
+        /// Command to run in the VM. Defaults to an interactive shell.
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
             value_name = "COMMAND"
         )]
         cmd: Vec<String>,
+    },
+
+    /// Run a single command inside a running boxme VM without a TTY: guest
+    /// stdout/stderr stay separate streams and the command's exit code becomes
+    /// boxme's. The scriptable counterpart of `attach` — for agents and scripts
+    /// inspecting a kept VM, e.g. `boxme exec git diff` or
+    /// `boxme exec --vm boxme-app-3f2a ls vendor`.
+    Exec {
+        /// Target VM name (see `boxme ps`). Defaults to the current folder's
+        /// single running VM.
+        #[arg(long, value_name = "NAME")]
+        vm: Option<String>,
+
+        /// Command to run in the VM, from /workspace.
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        cmd: Vec<String>,
+    },
+
+    /// List boxme's VMs — dev sessions, kept run/claude VMs, the setup
+    /// builder — with status and age. With the global --json flag, prints a
+    /// JSON array instead.
+    Ps,
+
+    /// Stop and remove boxme VMs by name, or every one with --all. Cleans up
+    /// kept VMs (--keep, or a failed copy-out) that outlived their run. Only
+    /// boxme's own VMs can be removed.
+    Kill {
+        /// VM names from `boxme ps`.
+        #[arg(
+            value_name = "NAME",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        names: Vec<String>,
+
+        /// Remove every boxme VM, running or not.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Run Claude Code inside the sandbox in full autonomy

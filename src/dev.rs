@@ -30,7 +30,7 @@ use crate::run::{
 };
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
-use crate::util::{slugify, stream_shell_stderr, tar_directory};
+use crate::util::{project_slug, stream_shell_stderr, tar_directory};
 
 /// Forwarded by default when no `--port` is given: artisan serve + Vite.
 const DEFAULT_PORTS: &[(u16, u16)] = &[(8000, 8000), (5173, 5173)];
@@ -104,39 +104,6 @@ pub async fn dev(cli: &Cli, cmd: &[String], port_specs: &[String]) -> Result<()>
 
     cleanup(cli, sb, &name).await;
     session
-}
-
-/// Open another shell — or run a one-off command — inside the running dev
-/// session for the current folder. Reaches the live VM by its deterministic name
-/// (`dev_vm_name`), connects as a second client, and runs an interactive TTY
-/// alongside the dev stack. Never tears the VM down: the `boxme dev` process owns
-/// its lifecycle, this is just a guest.
-pub async fn attach(cmd: &[String]) -> Result<()> {
-    let project_dir = std::env::current_dir()?;
-    let name = dev_vm_name(&project_dir);
-
-    let handle = Sandbox::get(&name).await.map_err(|_| {
-        anyhow!("no boxme dev session for this folder — start one with `boxme dev`")
-    })?;
-    if !matches!(handle.status(), SandboxStatus::Running) {
-        bail!("the boxme dev session for this folder isn't running — start one with `boxme dev`");
-    }
-    let sb = handle
-        .connect()
-        .await
-        .context("connecting to the dev session")?;
-
-    let inner = if cmd.is_empty() {
-        "cd /workspace && exec bash -l".to_string()
-    } else {
-        format!("cd /workspace && exec {}", quote_args(cmd))
-    };
-    eprintln!("{} {name}", ">> attached to".dimmed());
-    let result = sb.attach_with("bash", |a| a.args(["-lc", &inner])).await;
-    // Release the connection without stopping the VM — `boxme dev` owns it.
-    sb.detach().await;
-    result?;
-    Ok(())
 }
 
 /// Boot a guest from the base snapshot with the dev ports published. Mirrors
@@ -442,15 +409,10 @@ fn to_guest_rel(rel: &Path) -> Option<String> {
 /// the absolute-path hash keeps two same-named folders apart. One dev VM per
 /// folder is intentional — `dev` refuses to clobber a running one, and `attach`
 /// reuses it.
-fn dev_vm_name(project_dir: &Path) -> String {
+pub(crate) fn dev_vm_name(project_dir: &Path) -> String {
     let canonical =
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
-    let slug = slugify(
-        &project_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string()),
-    );
+    let slug = project_slug(project_dir);
     format!(
         "boxme-dev-{slug}-{:08x}",
         fnv1a(canonical.to_string_lossy().as_bytes())

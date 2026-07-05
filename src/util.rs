@@ -27,6 +27,15 @@ pub fn slugify(input: &str) -> String {
     }
 }
 
+/// The folder-name slug every boxme VM name is built from.
+pub fn project_slug(dir: &Path) -> String {
+    slugify(
+        &dir.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string()),
+    )
+}
+
 /// Single-quote a string for safe interpolation into a shell command line.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r#"'\''"#))
@@ -94,6 +103,39 @@ pub async fn stream_shell_stderr(sb: &Sandbox, script: &str) -> Result<i32> {
     }
 
     Ok(code)
+}
+
+/// Run a bash script inside the sandbox, forwarding its output stream-faithfully:
+/// guest stdout to host stdout, guest stderr to host stderr. Returns the exit
+/// code. This is `boxme exec`'s transport — unlike `stream_shell_stderr`, a
+/// caller can pipe the command's stdout.
+pub async fn stream_shell_split(sb: &Sandbox, script: &str) -> Result<i32> {
+    let mut handle = sb
+        .exec_stream_with("bash", |e| e.args(["-lc", script]))
+        .await?;
+
+    let mut code = -1;
+    let mut out_carry: Vec<u8> = Vec::new();
+    let mut err_carry: Vec<u8> = Vec::new();
+    while let Some(event) = handle.recv().await {
+        match event {
+            ExecEvent::Stdout(bytes) => forward(&mut out_carry, &bytes, &mut std::io::stdout()),
+            ExecEvent::Stderr(bytes) => forward(&mut err_carry, &bytes, &mut std::io::stderr()),
+            ExecEvent::Exited { code: c } => code = c,
+            ExecEvent::Failed(f) => return Err(anyhow!("command failed to start: {f:?}")),
+            _ => {}
+        }
+    }
+
+    Ok(code)
+}
+
+fn forward(carry: &mut Vec<u8>, bytes: &[u8], to: &mut impl Write) {
+    let data = decode_utf8_stream(carry, bytes);
+    if !data.is_empty() {
+        let _ = to.write_all(data.as_bytes());
+        let _ = to.flush();
+    }
 }
 
 /// Run a bash script inside the sandbox quietly, collecting stdout. Errors with

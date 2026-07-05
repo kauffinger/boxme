@@ -23,7 +23,7 @@ use crate::report;
 use crate::review::{self, Decision, FileItem, FileKind, NetRow, NetStatus, Review};
 use crate::scripts;
 use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
-use crate::util::{shell_capture, shell_quote, slugify, stream_shell_stderr};
+use crate::util::{project_slug, shell_capture, shell_quote, stream_shell_stderr};
 
 /// Fetching a unified diff per unexpected file is one guest exec each — cap it.
 const MAX_DIFFS: usize = 100;
@@ -911,7 +911,11 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
 /// Tear down the run VM, honoring `--keep`.
 pub(crate) async fn cleanup(cli: &Cli, sb: Sandbox, name: &str) {
     if cli.keep {
-        eprintln!("{} VM kept running as '{name}'", ">> --keep:".dimmed());
+        eprintln!(
+            "{} VM kept running as '{name}' — `boxme attach --vm {name}` opens a shell, \
+             `boxme kill {name}` removes it",
+            ">> --keep:".dimmed()
+        );
         sb.detach().await;
     } else {
         remove_vm(sb, name, "VM").await;
@@ -947,12 +951,7 @@ pub(crate) async fn ensure_cache_volumes() -> Result<()> {
 }
 
 pub(crate) fn vm_name(project_dir: &Path) -> String {
-    let slug = slugify(
-        &project_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string()),
-    );
+    let slug = project_slug(project_dir);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
