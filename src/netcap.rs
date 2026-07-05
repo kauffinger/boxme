@@ -163,10 +163,10 @@ fn parse_tcpdump_text(text: &str) -> Vec<NetworkContact> {
 
         // DNS answer: "... > 10.0.2.15.51234: 12345 2/0/0 CNAME x., A 1.2.3.4 (60)"
         if tokens.iter().any(|t| is_answer_counts(t)) {
-            // Only trust answers actually sourced from the slirp resolver: a
-            // guest process can craft a packet with a matching txn id to alias
+            // Only trust answers the host-side network stack actually delivered:
+            // a guest process can craft a packet with a matching txn id to alias
             // its exfil IP to a known registry domain in the review.
-            if !from_resolver(&tokens) {
+            if !trusted_answer(&tokens) {
                 continue;
             }
             let Some(id) = txn_id(&tokens) else { continue };
@@ -217,17 +217,26 @@ fn parse_tcpdump_text(text: &str) -> Vec<NetworkContact> {
         .collect()
 }
 
-/// The slirp DNS resolver every guest query goes to; the only source DNS
-/// answers may be joined from.
-const RESOLVER: (&str, u16) = ("10.0.2.3", 53);
-
-/// Whether the packet's source (the token before ">") is the slirp resolver.
-fn from_resolver(tokens: &[&str]) -> bool {
+/// Whether a DNS answer line may be joined: the packet must have arrived
+/// *inbound on the guest NIC* ("<ts> ethN In IP ...") with source port 53.
+/// Only the host-side network stack can inject an inbound eth frame — a
+/// guest-crafted forgery is captured as egress ("Out") and a self-sent packet
+/// traverses lo — so this holds without pinning a resolver IP. A pin would be
+/// wrong anyway: the answer's source varies by backend (slirp's 10.0.2.3, the
+/// smoltcp per-sandbox 172.16.x.1 gateway) and microsandbox's DNS interceptor
+/// answers from whatever IP the guest queried, gateway or not.
+fn trusted_answer(tokens: &[&str]) -> bool {
+    let inbound_on_nic = matches!(
+        (tokens.get(1), tokens.get(2)),
+        (Some(iface), Some(&"In")) if iface.starts_with("eth")
+    );
+    if !inbound_on_nic {
+        return false;
+    }
     let Some(gt) = tokens.iter().position(|t| *t == ">") else {
         return false;
     };
-    gt > 0
-        && split_ip_port(tokens[gt - 1]).is_some_and(|(ip, port)| (ip.as_str(), port) == RESOLVER)
+    gt > 0 && split_ip_port(tokens[gt - 1]).is_some_and(|(_, port)| port == 53)
 }
 
 /// The DNS transaction id is the first token after the `dst:` token — strip
@@ -302,6 +311,38 @@ mod tests {
         assert!(capture_banner(true, true)
             .unwrap()
             .contains("died during the run"));
+    }
+
+    #[test]
+    fn joins_answers_from_the_smoltcp_gateway() {
+        // microsandbox-network's smoltcp backend hands out per-sandbox
+        // 172.16.0.0/12 addresses (guest .2, gateway/resolver .1) — no
+        // 10.0.2.x anywhere. The join must not depend on the resolver IP.
+        let text = "\
+12:00:00.000000 eth0 Out IP 172.16.0.2.51234 > 172.16.0.1.53: 12345+ A? github.com. (28)
+12:00:00.010000 eth0 In  IP 172.16.0.1.53 > 172.16.0.2.51234: 12345 1/0/0 A 140.82.121.4 (44)
+12:00:00.020000 eth0 Out IP 172.16.0.2.40000 > 140.82.121.4.443: Flags [S], seq 1, win 64240, length 0
+";
+        let contacts = parse_tcpdump_text(text);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].domain.as_deref(), Some("github.com"));
+        assert!(contacts[0].known);
+    }
+
+    #[test]
+    fn ignores_forged_answer_sent_outbound_with_spoofed_resolver_source() {
+        // A guest root can raw-socket a packet whose source claims to be the
+        // resolver — but it leaves the NIC as egress, so tcpdump records it
+        // "Out" and the join must not trust it.
+        let text = "\
+12:00:00.000000 eth0 Out IP 172.16.0.2.51234 > 172.16.0.1.53: 12345+ A? github.com. (28)
+12:00:00.005000 eth0 Out IP 172.16.0.1.53 > 172.16.0.2.51234: 12345 1/0/0 A 6.6.6.6 (44)
+12:00:00.020000 eth0 Out IP 172.16.0.2.40000 > 6.6.6.6.443: Flags [S], seq 1, win 64240, length 0
+";
+        let contacts = parse_tcpdump_text(text);
+        assert_eq!(contacts.len(), 1);
+        assert!(contacts[0].domain.is_none(), "egress forgery must not join");
+        assert!(!contacts[0].known);
     }
 
     #[test]
