@@ -205,7 +205,9 @@ async fn json_run(ctx: &RunCtx<'_>, allow: Vec<String>) -> Result<i32> {
             v
         }
         Err(e) => {
-            discard(sb, &name).await;
+            // Honor --keep here too: a failed run is exactly when a kept VM is
+            // useful for poking around.
+            cleanup(ctx.cli, sb, &name).await;
             return Err(e);
         }
     };
