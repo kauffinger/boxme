@@ -56,6 +56,7 @@ pub fn raise_fd_limit() {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
             return;
         }
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut target = lim.rlim_max;
         #[cfg(target_os = "macos")]
         {
