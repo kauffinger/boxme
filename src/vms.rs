@@ -56,6 +56,8 @@ fn kind_label(kind: VmKind) -> &'static str {
 
 fn status_label(status: SandboxStatus) -> &'static str {
     match status {
+        SandboxStatus::Created => "created",
+        SandboxStatus::Starting => "starting",
         SandboxStatus::Running => "running",
         SandboxStatus::Draining => "draining",
         SandboxStatus::Paused => "paused",
@@ -89,7 +91,7 @@ pub async fn ps(json: bool) -> Result<()> {
             Some(VmRow {
                 name: h.name().to_string(),
                 kind: kind_label(kind),
-                status: status_label(h.status()),
+                status: status_label(h.status_snapshot()),
                 created_at: h.created_at().map(|t| t.to_rfc3339()),
                 age_seconds: h.created_at().map(|t| (now - t.timestamp()).max(0)),
             })
@@ -215,10 +217,10 @@ async fn connect_target(vm: Option<&str>) -> Result<(String, Sandbox)> {
     let handle = Sandbox::get(&name)
         .await
         .map_err(|_| anyhow!("no VM named '{name}' — `boxme ps` lists boxme's VMs"))?;
-    if !matches!(handle.status(), SandboxStatus::Running) {
+    if !matches!(handle.status_snapshot(), SandboxStatus::Running) {
         bail!(
             "VM '{name}' isn't running ({}) — `boxme kill {name}` removes it",
-            status_label(handle.status())
+            status_label(handle.status_snapshot())
         );
     }
     let sb = handle
@@ -235,7 +237,7 @@ async fn running_for_folder(dir: &Path) -> Result<Vec<String>> {
         .await
         .context("listing sandboxes")?
         .iter()
-        .filter(|h| matches!(h.status(), SandboxStatus::Running))
+        .filter(|h| matches!(h.status_snapshot(), SandboxStatus::Running))
         .map(|h| h.name().to_string())
         .filter(|n| belongs_to_folder(n, &dev_name, &slug))
         .collect())

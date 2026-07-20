@@ -434,7 +434,7 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 /// stopped one that `boot_dev`'s `.replace()` will clear).
 async fn dev_session_running(name: &str) -> bool {
     matches!(
-        Sandbox::get(name).await.map(|h| h.status()),
+        Sandbox::get(name).await.map(|h| h.status_snapshot()),
         Ok(SandboxStatus::Running)
     )
 }

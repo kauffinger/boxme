@@ -31,7 +31,7 @@ async fn ensure_runtime() -> Result<()> {
 /// poll until the status settles.
 async fn wait_until_stopped(name: &str) -> Result<()> {
     for _ in 0..50 {
-        let status = Sandbox::get(name).await?.status();
+        let status = Sandbox::get(name).await?.status_snapshot();
         if matches!(status, SandboxStatus::Stopped | SandboxStatus::Crashed) {
             return Ok(());
         }

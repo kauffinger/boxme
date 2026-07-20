@@ -209,7 +209,8 @@ fn secret(
 ) -> SecretEntry {
     SecretEntry {
         env_var: format!("BOXME_COMPOSER_AUTH_{idx}"),
-        value,
+        value: value.into(),
+        source: None,
         placeholder: placeholder(idx),
         allowed_hosts,
         injection,
@@ -239,9 +240,9 @@ mod tests {
 
         assert_eq!(auth.secrets.len(), 2);
         let username = &auth.secrets[0];
-        assert_eq!(username.value, "me@x.de");
+        assert_eq!(username.value.as_str(), "me@x.de");
         let password = &auth.secrets[1];
-        assert_eq!(password.value, "hunter2");
+        assert_eq!(password.value.as_str(), "hunter2");
         for s in &auth.secrets {
             assert_eq!(
                 s.allowed_hosts,
@@ -262,7 +263,7 @@ mod tests {
         let s = auth
             .secrets
             .iter()
-            .find(|s| s.value == "packagist-token-xyz")
+            .find(|s| s.value.as_str() == "packagist-token-xyz")
             .expect("username registered as a secret");
         assert_eq!(
             s.allowed_hosts,
@@ -275,7 +276,7 @@ mod tests {
         let auth = built(r#"{"github-oauth":{"github.com":"github_pat_xxx"}}"#);
         assert!(!auth.env.1.contains("github_pat_xxx"));
         let s = &auth.secrets[0];
-        assert_eq!(s.value, "github_pat_xxx");
+        assert_eq!(s.value.as_str(), "github_pat_xxx");
         assert_eq!(
             s.allowed_hosts,
             vec![
@@ -308,7 +309,7 @@ mod tests {
         placeholders.dedup();
         assert_eq!(placeholders.len(), 5, "placeholders must be unique");
         for s in &auth.secrets {
-            assert!(!auth.env.1.contains(&s.value));
+            assert!(!auth.env.1.contains(s.value.as_str()));
             assert!(auth.env.1.contains(&s.placeholder));
         }
     }
