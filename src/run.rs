@@ -549,7 +549,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     let changes = manifest::diff(&before, &after);
 
     // Sweep for anything the command wrote outside /workspace.
-    let outside = match shell_capture(sb, &scripts::outside_scan()).await {
+    let outside = match shell_capture(sb, &scripts::outside_scan(!ctx.secrets.is_empty())).await {
         Ok(out) => outside::parse(&out),
         Err(_) => OutsideScan::unavailable(),
     };

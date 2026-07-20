@@ -360,17 +360,30 @@ pub const BASELINE_MARKER: &str = "/root/.boxme-outside-baseline";
 /// composer/npm legitimately churn every run, `/boxme-upper.img` — the loop
 /// image backing the overlay upper, a plain rootfs file whose ctime bumps on
 /// every overlay write, so it would otherwise show up as a multi-GB outside
-/// write every run — and `/boxme-git`, the isolated baseline git dir (boxme's
-/// own machinery, written during the mount). Trading a little blind spot in
-/// those for signal in the rest of the tree. Output is `size\ttype\tpath`; a
-/// missing marker prints `#NOMARKER`.
-pub fn outside_scan() -> String {
+/// write every run — `/boxme-git`, the isolated baseline git dir (boxme's own
+/// machinery, written during the mount) — and the VM's own boot plumbing:
+/// agentd writes /etc/hosts, /etc/hostname and /etc/resolv.conf on its own
+/// schedule, which races the baseline marker, and `/.msb` is the agent's
+/// runtime dir. When TLS interception is on (`--composer-auth`) the agent also
+/// installs the proxy CA into the guest trust store, so those paths are pruned
+/// too — but only then, so a rogue CA install by a postinstall script still
+/// shows up in a normal run. Trading a little blind spot in those for signal
+/// in the rest of the tree. Output is `size\ttype\tpath`; a missing marker
+/// prints `#NOMARKER`.
+pub fn outside_scan(tls_intercepting: bool) -> String {
+    let ca_prunes = if tls_intercepting {
+        " -o -path /etc/ssl/certs -o -path /usr/local/share/ca-certificates \\
+     -o -path /etc/ca-certificates.conf -o -path /etc/ca-certificates"
+    } else {
+        ""
+    };
     format!(
         r#"marker={BASELINE_MARKER}
 if [ ! -e "$marker" ]; then echo '#NOMARKER'; exit 0; fi
 find / -xdev -mindepth 1 \
   \( -path /workspace -o -path /boxme-upper -o -path /boxme-upper.img \
-     -o -path /boxme-git \
+     -o -path /boxme-git -o -path /.msb \
+     -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf{ca_prunes} \
      -o -path /proc -o -path /sys -o -path /dev -o -path /run \
      -o -path /tmp -o -path /var/tmp -o -path /var/log -o -path /var/cache \
      -o -path /var/lib/apt -o -path /root/.cache -o -path /root/.npm \
@@ -408,5 +421,19 @@ mod tests {
             assert!(script.contains("\"/workspace\""));
             assert!(script.contains("\"hasTrustDialogAccepted\": true"));
         }
+    }
+
+    #[test]
+    fn outside_scan_prunes_boot_plumbing_and_gates_ca_store() {
+        // agentd writes these on its own schedule — always pruned.
+        for scan in [outside_scan(false), outside_scan(true)] {
+            for path in ["/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/.msb"] {
+                assert!(scan.contains(&format!("-path {path}")), "{path} not pruned");
+            }
+        }
+        // The trust store is pruned only under TLS interception, so a rogue CA
+        // install still shows up in a normal run.
+        assert!(outside_scan(true).contains("-path /etc/ssl/certs"));
+        assert!(!outside_scan(false).contains("-path /etc/ssl/certs"));
     }
 }
