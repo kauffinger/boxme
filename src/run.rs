@@ -855,11 +855,24 @@ fn host_npm_target() -> Option<(&'static str, &'static str)> {
 pub(crate) fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
     specs
         .iter()
-        .map(|spec| match spec.split_once('=') {
-            Some((key, value)) => Ok((key.to_string(), value.to_string())),
-            None => std::env::var(spec)
-                .map(|value| (spec.clone(), value))
-                .map_err(|_| anyhow!("-e {spec}: not set in the host environment")),
+        .map(|spec| {
+            let (key, value) = match spec.split_once('=') {
+                Some((key, value)) => (key.to_string(), value.to_string()),
+                None => {
+                    let value = std::env::var(spec)
+                        .map_err(|_| anyhow!("-e {spec}: not set in the host environment"))?;
+                    (spec.clone(), value)
+                }
+            };
+            // The env transport into the VM can't carry these — a newline
+            // SIGABRTs the VMM before boot — so fail with a real error instead.
+            if value.contains(['\n', '\r', '\0']) {
+                bail!(
+                    "-e {key}: multiline values are not supported — the value must \
+                     not contain newlines"
+                );
+            }
+            Ok((key, value))
         })
         .collect()
 }
@@ -1110,5 +1123,17 @@ mod tests {
             enforced_status(&contact(None, false), &allow, true),
             (NetStatus::Blocked, false)
         );
+    }
+
+    #[test]
+    fn resolve_env_rejects_multiline_values() {
+        // A newline in a guest env value SIGABRTs the VMM before boot.
+        let err = resolve_env(&["KEY=line one\nline two".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("multiline"), "{err}");
+        assert!(resolve_env(&["KEY=cr\rvalue".to_string()]).is_err());
+
+        // Plain values still pass, including '=' inside the value.
+        let ok = resolve_env(&["KEY=a=b".to_string()]).unwrap();
+        assert_eq!(ok, vec![("KEY".to_string(), "a=b".to_string())]);
     }
 }
