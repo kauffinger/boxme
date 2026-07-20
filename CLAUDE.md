@@ -60,7 +60,7 @@ git push origin v0.2.0
 natively (one hosted runner each — cross-compiling the microsandbox/msb_krun tree
 is not worth the pain), packages each as `boxme-<target>.tar.gz` + a `.sha256`,
 and publishes them to a Release via the runner's `gh` CLI. Builds use `--locked`
-so the `time` ceiling in `Cargo.lock` is honored. `install.sh` resolves the
+so the pinned dependency set in `Cargo.lock` is honored. `install.sh` resolves the
 latest tag from the releases redirect (no API rate limit), downloads the matching
 tarball, and verifies the checksum before installing to `~/.local/bin`. The
 workflow can also be run manually (`workflow_dispatch`) with a tag input.
@@ -75,14 +75,13 @@ msb_krun is otherwise pure Rust, so there is no libkrun system package.
 Tests are pure unit tests in `#[cfg(test)] mod tests` blocks (in `netcap.rs`,
 `allowlist.rs`, `manifest.rs`, `outside.rs`, `review.rs`, `report.rs`,
 `copyback.rs`, `skills.rs`, `vms.rs`, `run.rs`, `claude.rs`,
-`composer_auth.rs`). There is no
+`composer_auth.rs`, `detect.rs`, `scripts.rs`, `util.rs`). There is no
 integration-test harness — anything touching the sandbox is exercised by running
 `boxme` against a real project. There is no rustfmt/clippy config and no
 toolchain pin; default stable applies.
 
-Note the deliberate version ceiling on `time` in `Cargo.toml`: `>=0.3.6,
-<0.3.47` works around an rcgen 0.14 coherence conflict pulled in transitively by
-`microsandbox-network`. Don't bump it until rcgen ships a fix.
+(The old `time` version ceiling in `Cargo.toml` is gone: rcgen 0.14.8 fixed the
+coherence conflict, so `time` floats freely again.)
 
 ## Architecture
 
@@ -236,7 +235,10 @@ assumption; verify these on a real `boxme dev` run.
 - `detect.rs` — resolves guest PHP `X.Y` and Node major: host binary run from the
   project dir first (so mise/asdf/herd shims resolve per-directory), then
   manifest constraints (`composer.json` require.php, `.nvmrc`, `engines.node`),
-  then defaults. PHP is clamped to the 8.3–8.5 baked into the image.
+  then defaults. PHP is clamped to the 8.3–8.5 baked into the image. The host
+  PHP wins only when it doesn't contradict the composer.json constraint (a
+  small `satisfies` checker handles `^`/`~`/ranges/`||` at X.Y granularity) —
+  a project requiring ^8.5 boots 8.5 even when the host runs 8.3.
 - `scripts.rs` — **every shell snippet that runs inside the guest lives here** as
   a `const` or a `format!`-returning fn. The base-image setup (which now also
   bakes `@anthropic-ai/claude-code`), the unpack/baseline script, version
