@@ -458,6 +458,7 @@ dependencies = [
  "clap",
  "crossterm 0.29.0",
  "flate2",
+ "libc",
  "microsandbox",
  "microsandbox-network",
  "notify",

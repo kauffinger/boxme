@@ -23,6 +23,9 @@ use owo_colors::OwoColorize;
 
 #[tokio::main]
 async fn main() {
+    // Before anything can spawn the VMM: it inherits our RLIMIT_NOFILE, and
+    // every open virtiofs lower file pins a host fd in it (see raise_fd_limit).
+    util::raise_fd_limit();
     let parsed = cli::Cli::parse();
     // `run` maps its non-interactive report onto an exit code; everything else
     // is success/failure.

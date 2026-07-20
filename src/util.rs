@@ -36,6 +36,50 @@ pub fn project_slug(dir: &Path) -> String {
     )
 }
 
+/// Raise this process's soft `RLIMIT_NOFILE` to the hard limit, so the msb VMM
+/// (which inherits our rlimits) can hold one host fd per open virtiofs lower
+/// file. Every guest-side open of a lower-layer file — overlayfs copy-up,
+/// fileattr reads, a parallel `composer update` churning `vendor/` — pins an fd
+/// in the VMM, and the default macOS soft limit is low enough that a burst
+/// returns EMFILE to the guest kernel, surfacing as arbitrary "Could not
+/// delete" / copy-up failures mid-run.
+///
+/// On macOS the hard limit reports as `RLIM_INFINITY`, but `setrlimit` rejects
+/// anything above `kern.maxfilesperproc`, so clamp to that. Best-effort: a
+/// failure here just leaves the old limit in place.
+pub fn raise_fd_limit() {
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let mut target = lim.rlim_max;
+        #[cfg(target_os = "macos")]
+        {
+            let mut max: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>();
+            if libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                std::ptr::from_mut(&mut max).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+                && max > 0
+            {
+                target = target.min(max as libc::rlim_t);
+            }
+        }
+        if target > lim.rlim_cur {
+            lim.rlim_cur = target;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+}
+
 /// Single-quote a string for safe interpolation into a shell command line.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r#"'\''"#))
@@ -195,4 +239,22 @@ pub async fn tar_directory(dir: &Path, out_tgz: &Path) -> Result<()> {
     })
     .await
     .with_context(|| format!("packing {} failed", label.display()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raise_fd_limit_lifts_soft_to_hard() {
+        raise_fd_limit();
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        // The default macOS soft limit (256–10240) is what starves the VMM of
+        // fds; after raising we must be well past it.
+        assert!(lim.rlim_cur > 10240, "soft limit still {}", lim.rlim_cur);
+    }
 }
