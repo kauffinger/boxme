@@ -47,6 +47,12 @@ boxme command in the same repo: `.boxme/pending` is a single slot and the next
 run replaces it, and the next VM mounts the host tree as-is, so an unapplied
 update is invisible to the following step.
 
+When one step depends on another's output (e.g. a script hook that needs
+`vendor/` present), don't apply in between — chain the commands with `++` in a
+single run: `boxme --json composer install ++ composer run-script
+post-update-cmd`. The chain runs in one VM, stops at the first failure, and
+stages one combined changeset.
+
 ### Composer repos
 
 1. `boxme --json composer update > report.json 2> boxme.log`

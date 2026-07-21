@@ -63,8 +63,9 @@ enum AfterReview {
 struct RunCtx<'a> {
     cli: &'a Cli,
     project_dir: &'a Path,
-    tool: &'a str,
-    args: &'a [String],
+    /// The `++`-separated command chain; each entry is one composer/npm
+    /// invocation, run in order in the same guest as one changeset.
+    commands: &'a [Vec<String>],
     write_set: &'a WriteSet,
     php: &'a str,
     node: Option<u32>,
@@ -77,23 +78,21 @@ struct RunCtx<'a> {
 
 pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     // 1. Validate + detect.
-    let tool = args.first().map(String::as_str).unwrap_or("");
-    if !matches!(tool, "composer" | "npm") {
-        bail!("boxme only wraps `composer` and `npm` (got `{tool}`)");
-    }
+    let commands = split_commands(args)?;
     if let Some(conflict) = conflicting_flags(cli) {
         bail!("{conflict}");
     }
     // The review TUI and the attached command both need a terminal — without
     // one, point at the non-interactive flow instead of hanging or garbling.
     if !cli.json && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
+        let tool = &commands[0][0];
         bail!(
             "no terminal for the review UI — use `boxme --json {tool} …` for the \
              non-interactive flow (JSON report on stdout, then `boxme apply` or \
              `boxme discard`)"
         );
     }
-    let write_set = manifest::expected_write_set(tool, &args[1..]);
+    let write_set = manifest::expected_write_set_all(&commands);
 
     if !base_snapshot_exists().await? {
         bail!("base snapshot missing — run `boxme setup` first");
@@ -113,7 +112,7 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     // `--composer-auth` lifts the host's global auth.json into the guest as
     // placeholder secrets the in-guest TLS proxy substitutes per host. Only
     // composer authenticates with it, so npm runs ignore the flag.
-    let secrets = if cli.composer_auth && tool == "composer" {
+    let secrets = if cli.composer_auth && uses_tool(&commands, "composer") {
         composer_auth::inject(&mut env)?
     } else {
         Vec::new()
@@ -123,8 +122,7 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     let ctx = RunCtx {
         cli,
         project_dir: &project_dir,
-        tool,
-        args,
+        commands: &commands,
         write_set: &write_set,
         php: &php,
         node,
@@ -178,6 +176,39 @@ pub(crate) fn conflicting_flags(cli: &Cli) -> Option<&'static str> {
         );
     }
     None
+}
+
+/// Split the package-manager tokens on `++` into a chain of commands, each of
+/// which must start with a supported tool. The chain runs sequentially in one
+/// guest and produces one combined changeset —
+/// `boxme composer install ++ composer run-script post-update-cmd` lets the
+/// script hook see `vendor/` without an apply in between.
+fn split_commands(args: &[String]) -> Result<Vec<Vec<String>>> {
+    let mut commands: Vec<Vec<String>> = vec![Vec::new()];
+    for arg in args {
+        if arg == "++" {
+            commands.push(Vec::new());
+        } else {
+            commands
+                .last_mut()
+                .expect("starts non-empty")
+                .push(arg.clone());
+        }
+    }
+    for cmd in &commands {
+        match cmd.first().map(String::as_str) {
+            Some("composer") | Some("npm") => {}
+            Some(tool) => bail!("boxme only wraps `composer` and `npm` (got `{tool}`)"),
+            None => bail!("empty command in a `++` chain"),
+        }
+    }
+    Ok(commands)
+}
+
+/// Whether any command in the chain runs `tool`. Valid only after
+/// `split_commands`, which guarantees every command has a first token.
+fn uses_tool(commands: &[Vec<String>], tool: &str) -> bool {
+    commands.iter().any(|c| c[0] == tool)
 }
 
 /// Non-interactive run: enforce, run the command (output streamed to stderr —
@@ -459,8 +490,12 @@ async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> 
 /// Run the package-manager command in an already-booted guest and gather the
 /// before/after manifest diff and network capture. Does not review or copy back.
 async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
-    let (tool, args, write_set, php, node) = (ctx.tool, ctx.args, ctx.write_set, ctx.php, ctx.node);
-    let command_line = args.join(" ");
+    let (commands, write_set, php, node) = (ctx.commands, ctx.write_set, ctx.php, ctx.node);
+    let command_line = commands
+        .iter()
+        .map(|c| c.join(" "))
+        .collect::<Vec<_>>()
+        .join(" ++ ");
 
     // Mount the project read-only as the overlay lower and tag the guest
     // baseline. Nothing is copied in — reads fall through to the host tree via
@@ -472,7 +507,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     }
 
     // Match host versions.
-    if tool == "composer" {
+    if uses_tool(commands, "composer") {
         let code = stream_shell_stderr(sb, &scripts::php_switch(php)).await?;
         if code != 0 {
             bail!("switching the guest to PHP {php} failed");
@@ -510,12 +545,22 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     // --json mode, where there is no one at a TTY and stdout is reserved for
     // the report — there it runs detached with output streamed to stderr.
     eprintln!("{} {command_line}\n", ">> running:".dimmed());
-    let npm_env = npm_platform_export(tool, &ctx.env);
-    let guest_cmd = format!(
-        "{}; {npm_env}cd /workspace && exec {}",
-        scripts::RAISE_FDS,
-        quote_args(args)
-    );
+    let npm_env = npm_platform_export(uses_tool(commands, "npm"), &ctx.env);
+    // A `++` chain becomes `&&`: a failure stops the run and its exit code
+    // becomes the chain's. A single command still execs to replace the shell.
+    let chain = commands
+        .iter()
+        .map(|c| quote_args(c))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let guest_cmd = if commands.len() == 1 {
+        format!(
+            "{}; {npm_env}cd /workspace && exec {chain}",
+            scripts::RAISE_FDS
+        )
+    } else {
+        format!("{}; {npm_env}cd /workspace && {chain}", scripts::RAISE_FDS)
+    };
     let exit_code = if ctx.cli.json {
         stream_shell_stderr(sb, &guest_cmd).await?
     } else {
@@ -815,11 +860,11 @@ pub(crate) fn quote_args(args: &[String]) -> String {
 /// A guest-shell `export` that makes a Linux-guest `npm install` resolve the
 /// *host's* platform-gated native deps, so the copied-back `node_modules` has
 /// the macOS prebuilt binaries (esbuild, rollup, lightningcss, swc, sharp, …)
-/// the host will load — empty if not npm, the host isn't macOS, or the user
-/// already pinned `npm_config_os` via `-e` (their value wins). Prints a note so
-/// the run is honest about retargeting the install.
-fn npm_platform_export(tool: &str, env: &[(String, String)]) -> String {
-    if tool != "npm" || env.iter().any(|(k, _)| k == "npm_config_os") {
+/// the host will load — empty if no chained command is npm, the host isn't
+/// macOS, or the user already pinned `npm_config_os` via `-e` (their value
+/// wins). Prints a note so the run is honest about retargeting the install.
+fn npm_platform_export(uses_npm: bool, env: &[(String, String)]) -> String {
+    if !uses_npm || env.iter().any(|(k, _)| k == "npm_config_os") {
         return String::new();
     }
     match host_npm_target() {
@@ -1083,6 +1128,37 @@ mod tests {
         assert!(
             conflicting_flags(&parse(&["boxme", "--strict", "--json", "composer", "i"])).is_none()
         );
+    }
+
+    #[test]
+    fn split_commands_chains_on_plus_plus() {
+        let args = |tokens: &[&str]| tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            split_commands(&args(&["composer", "install"])).unwrap(),
+            vec![args(&["composer", "install"])]
+        );
+        assert_eq!(
+            split_commands(&args(&[
+                "composer",
+                "install",
+                "++",
+                "composer",
+                "run-script",
+                "post-update-cmd",
+            ]))
+            .unwrap(),
+            vec![
+                args(&["composer", "install"]),
+                args(&["composer", "run-script", "post-update-cmd"]),
+            ]
+        );
+
+        // Every segment must be a supported tool, and no segment may be empty.
+        assert!(split_commands(&args(&["php", "artisan"])).is_err());
+        assert!(split_commands(&args(&["composer", "i", "++", "php", "-v"])).is_err());
+        assert!(split_commands(&args(&["composer", "i", "++"])).is_err());
+        assert!(split_commands(&args(&["++", "composer", "i"])).is_err());
     }
 
     fn contact(domain: Option<&str>, known: bool) -> NetworkContact {

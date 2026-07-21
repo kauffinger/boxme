@@ -49,7 +49,13 @@ boxme --keep npm install            # keep the VM after the run
 boxme --memory 4096 --cpus 4 composer update
 boxme -e NPM_TOKEN=xyz npm install  # env into the guest — visible to package code
 boxme -a composer install           # --composer-auth: credentials the guest can't read
+boxme composer install ++ composer run-script post-update-cmd
+                                    # chain with ++: one sandbox, one combined changeset
 ```
+
+A `++` chain runs the commands in order in the same guest and stops at the
+first failure — so a script hook runs with the install's `vendor/` already in
+place, and everything lands (or is staged, under `--json`) as one changeset.
 
 Existing `vendor/` and `node_modules/` stay visible, so incremental commands do
 incremental work. For a clean install, remove them on the host first or use

@@ -59,6 +59,12 @@ Decide on each staged changeset (apply/discard) **before** running the next
 boxme command in the same repo: `.boxme/pending` is a single slot and the next
 run replaces it.
 
+When one step depends on another's output (e.g. a script hook that needs
+`vendor/` present), don't apply in between — chain the commands with `++` in a
+single run: `boxme --json composer fix --no-fail ++ composer run-script
+post-update-cmd`. The chain runs in one VM, stops at the first failure, and
+stages one combined changeset.
+
 ### Composer repos
 
 1. `boxme --json composer fix --no-fail > report.json 2> boxme.log`

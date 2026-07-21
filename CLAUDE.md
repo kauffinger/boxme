@@ -98,8 +98,11 @@ package-manager command (and before `claude`). `run::run` returns an exit code
 (`main` propagates it) so the `--json` report can drive scripts; `vms::exec`
 likewise returns the guest command's exit code.
 
-`run.rs` is the orchestrator and the file to read first. It validates the tool
-is `composer`/`npm`, detects versions, then chooses one of three paths (the TUI
+`run.rs` is the orchestrator and the file to read first. It splits the args on
+`++` into a command chain (`split_commands` — each command must start with
+`composer`/`npm`; the chain runs sequentially in one guest via `&&` and
+produces one combined changeset, with `manifest::expected_write_set_all` as the
+union write-set), detects versions, then chooses one of three paths (the TUI
 paths fail fast with a pointer to `--json` when stdin/stdout isn't a terminal):
 
 - **`enforced_run`** — deny-by-default pass: boot under the allowlist, run,

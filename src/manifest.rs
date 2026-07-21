@@ -119,6 +119,29 @@ impl WriteSet {
     }
 }
 
+/// Union of the expected write-sets of a `++` command chain — every command
+/// runs in the same guest and produces one combined changeset, so anything any
+/// of them may legitimately touch is expected.
+pub fn expected_write_set_all(commands: &[Vec<String>]) -> WriteSet {
+    let mut dirs: Vec<&'static str> = Vec::new();
+    let mut files: Vec<&'static str> = Vec::new();
+    for cmd in commands {
+        let tool = cmd.first().map(String::as_str).unwrap_or("");
+        let ws = expected_write_set(tool, cmd.get(1..).unwrap_or(&[]));
+        for dir in ws.dirs {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        for file in ws.files {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+    WriteSet { dirs, files }
+}
+
 /// Expected write-set per command. `tool` is "composer" or "npm";
 /// `args` everything after it.
 pub fn expected_write_set(tool: &str, args: &[String]) -> WriteSet {
@@ -180,6 +203,22 @@ mod tests {
             Some("d41d8cd98f00b204e9800998ecf8427e")
         );
         assert_eq!(manifest.get("src").unwrap().kind, 'd');
+    }
+
+    #[test]
+    fn write_set_union_covers_every_chained_command() {
+        let cmd = |tokens: &[&str]| tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+
+        let ws = expected_write_set_all(&[cmd(&["composer", "install"]), cmd(&["npm", "ci"])]);
+        assert_eq!(ws.dirs, vec!["vendor", "node_modules"]);
+        assert_eq!(ws.files, vec!["composer.lock", "package-lock.json"]);
+
+        // Overlapping sets dedupe; a segment widening the set (update mutates
+        // composer.json) still contributes its extras.
+        let ws =
+            expected_write_set_all(&[cmd(&["composer", "install"]), cmd(&["composer", "update"])]);
+        assert_eq!(ws.dirs, vec!["vendor"]);
+        assert_eq!(ws.files, vec!["composer.lock", "composer.json"]);
     }
 
     #[test]
