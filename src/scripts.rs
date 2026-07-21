@@ -41,7 +41,14 @@ echo 'export COMPOSER_ALLOW_SUPERUSER=1' > /etc/profile.d/composer.sh
 export COMPOSER_ALLOW_SUPERUSER=1
 echo ">> installing composer-fix (updates packages flagged by composer audit)"
 composer global config allow-plugins.innobrain/composer-fix true
-composer global require innobrain/composer-fix --no-interaction
+# Exempt our own plugins from the 7-day soak window: a fresh composer-fix
+# release is by definition younger than the cooldown, and this global install is
+# a boxme-controlled dependency, not project-supplied supply chain. Scoped to
+# the two packages by name — the window still applies to everything else.
+composer global config --json extra.soak-time-whitelist '["innobrain/composer-fix","innobrain/soak-time"]'
+# Pinned to the 2.x line: the fleet-fix skill relies on `--no-fail`, which 2.0.0
+# introduced, and a future major could change the exit contract again.
+composer global require innobrain/composer-fix:^2.0 --no-interaction
 echo ">> installing composer soak-time (supply-chain safety: blocks deps younger than 7 days)"
 composer global config allow-plugins.innobrain/soak-time true
 # The plugin can't observe its own dist download (it isn't loaded yet), so its

@@ -13,11 +13,14 @@ version is out of range is reported as skipped, never forced.
 
 The tools:
 
-- **composer:** `composer fix` — the `innobrain/composer-fix` plugin baked into
-  boxme's base image. It audits installed packages and runs a targeted
-  in-range update of the vulnerable ones only. Out-of-range fixes are reported
-  and left alone; the command still exits 0, so residual vulnerabilities are
-  not a failure.
+- **composer:** `composer fix --no-fail` — the `innobrain/composer-fix` plugin
+  baked into boxme's base image. It audits installed packages and runs a
+  targeted in-range update of the vulnerable ones only. Out-of-range fixes are
+  reported and left alone. `--no-fail` is required: without it the command
+  exits 1 whenever any advisory survives the update, which boxme reports as a
+  failed command (exit 2) and stages nothing — throwing away the in-range fixes
+  it did make. Residual vulnerabilities are this skill's expected outcome, not
+  a failure.
 - **npm:** `npm audit fix` — same semantics, non-breaking without `--force`.
 
 This skill only fixes vulnerabilities. If the user wants dependencies updated
@@ -58,7 +61,7 @@ run replaces it.
 
 ### Composer repos
 
-1. `boxme --json composer fix > report.json 2> boxme.log`
+1. `boxme --json composer fix --no-fail > report.json 2> boxme.log`
    (add `--composer-auth` if `composer.json` has a `repositories` section that
    plausibly needs credentials and the host has a global composer `auth.json`).
    **Never pass `--force`** — that rewrites root constraints (breaking), which
@@ -67,6 +70,10 @@ run replaces it.
    predates the plugin — tell them to run `boxme setup --force`, and skip the
    composer side of the sweep (do not fall back to `composer update`; that is
    the fleet-update skill's job and causes churn this skill promises to avoid).
+   If it shows `--no-fail` is not a defined option, the snapshot predates
+   composer-fix 2.0.0 — same remedy, `boxme setup --force`.
+   `composer fix` needs either an installed `vendor/` or a `composer.lock`; a
+   repo with neither exits 1 and is reported as unfixable, not retried.
 2. Handle the exit code (see "Exit codes and findings" below); on success,
    `boxme apply`.
 3. After a successful apply, list what is still vulnerable for the final
