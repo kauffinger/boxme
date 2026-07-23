@@ -58,7 +58,10 @@ composer global require innobrain/soak-time --prefer-source --no-interaction
 echo ">> upgrading npm (need >= 11.10.0 for min-release-age cooldown)"
 npm install -g npm@latest
 echo ">> installing Claude Code (@anthropic-ai/claude-code) for \`boxme claude\`"
-npm install -g @anthropic-ai/claude-code
+# npm >= 12 blocks install scripts by default; claude-code's postinstall is what
+# downloads the native `claude` binary, so without this the install "succeeds"
+# but `claude` bails with "native binary not installed".
+npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code
 echo ">> enabling npm min-release-age (supply-chain safety: 7-day cooldown on new packages)"
 npm config set min-release-age 7 --location=global
 echo ">> installing n (Node version switcher; downloads land on the boxme-node-versions volume)"
