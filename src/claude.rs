@@ -35,7 +35,7 @@ use crate::run::{
     vm_name,
 };
 use crate::scripts;
-use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
+use crate::setup::{base_builder, base_snapshot_exists, BASE_SNAPSHOT};
 use crate::util::{shell_capture, stream_shell_stderr};
 
 /// Auth credentials boxme forwards from the host shell when the user didn't pass
@@ -466,8 +466,7 @@ async fn boot(
     let project_dir =
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
     let intercept = !secrets.is_empty();
-    let mut builder = Sandbox::builder(name)
-        .from_snapshot(BASE_SNAPSHOT)
+    let mut builder = base_builder(name)
         .memory(cli.memory)
         .cpus(cli.cpus)
         .replace()
