@@ -33,7 +33,8 @@ The installer verifies a checksum and installs to `~/.local/bin`
 (`BOXME_INSTALL_DIR` overrides; append `-s -- v0.1.0` to pin a version). Or
 build from source with `cargo install --path . --locked`. `boxme setup` also
 downloads the pinned microsandbox runtime into `~/.microsandbox` — no separate
-install needed.
+install needed. To upgrade, re-run the one-liner, then `boxme setup` once: it
+brings the runtime up to the new boxme's version without rebuilding the snapshot.
 
 ## Usage
 
