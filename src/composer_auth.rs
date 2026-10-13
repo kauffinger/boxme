@@ -24,7 +24,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use microsandbox_network::secrets::config::{HostPattern, SecretEntry, SecretInjection};
+use microsandbox_network::secrets::config::{HostPattern, SecretEntry, SecretSubstitution};
 use owo_colors::OwoColorize;
 
 /// Guest-side path where microsandbox's agent installs the TLS interception CA.
@@ -120,7 +120,8 @@ fn build(mut value: serde_json::Value) -> Option<ComposerAuth> {
 
     // Token-style sections: a flat `{ host: "token" }` map. The token can ride
     // in an Authorization header (`Bearer`/`token`), a Basic-auth username (git
-    // over HTTPS), or a `?access_token=` query, so allow all three scopes.
+    // over HTTPS), or a `?access_token=` query, so allow headers (which covers
+    // decoded Basic auth) and the query.
     for section in ["github-oauth", "gitlab-oauth", "gitlab-token", "bearer"] {
         let is_github = section == "github-oauth";
         let Some(map) = obj.get_mut(section).and_then(|v| v.as_object_mut()) else {
@@ -133,7 +134,7 @@ fn build(mut value: serde_json::Value) -> Option<ComposerAuth> {
                 idx,
                 real.to_string(),
                 allowed_hosts(host, is_github),
-                token_injection(),
+                token_substitution(),
             ));
             *token = serde_json::Value::String(placeholder(idx));
         }
@@ -159,7 +160,9 @@ fn build(mut value: serde_json::Value) -> Option<ComposerAuth> {
                     idx,
                     real.to_string(),
                     allowed_hosts(&host, false),
-                    SecretInjection::default(),
+                    // Headers only — the default, which includes decoded
+                    // `Authorization: Basic` credentials.
+                    SecretSubstitution::default(),
                 ));
                 *value = serde_json::Value::String(placeholder(idx));
             }
@@ -188,12 +191,11 @@ fn allowed_hosts(host: &str, is_github: bool) -> Vec<HostPattern> {
     hosts
 }
 
-fn token_injection() -> SecretInjection {
-    SecretInjection {
+fn token_substitution() -> SecretSubstitution {
+    SecretSubstitution {
         headers: true,
-        basic_auth: true,
-        query_params: true,
-        body: false,
+        query: true,
+        ..SecretSubstitution::default()
     }
 }
 
@@ -205,7 +207,7 @@ fn secret(
     idx: usize,
     value: String,
     allowed_hosts: Vec<HostPattern>,
-    injection: SecretInjection,
+    substitution: SecretSubstitution,
 ) -> SecretEntry {
     SecretEntry {
         env_var: format!("BOXME_COMPOSER_AUTH_{idx}"),
@@ -213,8 +215,10 @@ fn secret(
         source: None,
         placeholder: placeholder(idx),
         allowed_hosts,
-        injection,
-        on_violation: None,
+        substitution,
+        passthrough_hosts: Vec::new(),
+        // `None` keeps the config default, `BlockAndLog`.
+        violation_action: None,
         require_tls_identity: true,
     }
 }
@@ -248,7 +252,9 @@ mod tests {
                 s.allowed_hosts,
                 vec![HostPattern::Wildcard("*.composer.fluxui.dev".to_string())]
             );
-            assert!(s.injection.basic_auth);
+            // Header substitution includes decoded `Authorization: Basic`.
+            assert!(s.substitution.headers);
+            assert!(!s.substitution.query);
             assert!(s.require_tls_identity);
         }
     }
@@ -284,8 +290,9 @@ mod tests {
                 HostPattern::Wildcard("*.githubusercontent.com".to_string()),
             ]
         );
-        // A token can travel as a header, basic-auth username, or query param.
-        assert!(s.injection.headers && s.injection.basic_auth && s.injection.query_params);
+        // A token can travel as a header (incl. basic-auth username) or query param.
+        assert!(s.substitution.headers && s.substitution.query);
+        assert!(!s.substitution.body);
     }
 
     #[test]

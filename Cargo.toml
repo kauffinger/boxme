@@ -1,14 +1,19 @@
 [package]
 name = "boxme"
-version = "0.1.0"
+version = "0.10.0"
 edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
-microsandbox = "0.6"
-microsandbox-network = "0.6"
+# Local backend only. No `cloud`, and no `download-binaries`: that installs the
+# runtime into the *build* machine's ~/.microsandbox at compile time, which is
+# useless for a released binary — `boxme setup` installs it on the user's host.
+microsandbox = { version = "0.7", default-features = false, features = ["local", "net", "keyring"] }
+# Types only (SecretEntry, policy). The network engine lives in the `msb`
+# runtime binary since 0.7, so don't compile it into boxme.
+microsandbox-network = { version = "0.7", default-features = false }
 ratatui = "0.29"
 crossterm = "0.29"
 tar = "0.4"

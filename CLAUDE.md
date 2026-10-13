@@ -224,17 +224,30 @@ assumption; verify these on a real `boxme dev` run.
 ### Module responsibilities
 
 - `setup.rs` — provisions the libkrun runtime via the SDK
-  (`microsandbox::setup::install`, pinned to the linked crate's
-  `PREBUILT_VERSION`, into `~/.microsandbox/{bin,lib}`), then builds the
-  `boxme-base` snapshot from `node:24` (one-time, slow). The runtime install is
-  idempotent — a no-op once the matching version is present — so no separate
-  microsandbox CLI install is required. The builder sets the writable overlay
-  (`oci_upper_size`, `--disk` GiB, default 32) — this is the *only* place the
-  per-run disk ceiling can be set, because booting `from_snapshot` inherits the
-  snapshot's fixed-size `upper.ext4` and the SDK forbids resizing it at boot. The
-  default microsandbox overlay is just 4 GiB, which a large repo + vendor +
+  (`microsandbox::setup::install_runtime`, pinned to the linked crate's
+  `PREBUILT_VERSION` via `InstallOptions::default`, into
+  `~/.microsandbox/{bin,lib}`), then builds the `boxme-base` snapshot from
+  `node:24` (one-time, slow). The runtime install is idempotent — a no-op once
+  the matching version is present (checked with `resolve_runtime_version`; the
+  SDK's own `ensure_runtime` would accept any older pair), a forced re-download
+  on mismatch — so no separate microsandbox CLI install is required. It runs
+  before the snapshot-exists early return, so a plain `boxme setup` after a boxme
+  update brings the runtime up to the new SDK without `--force`. The crate
+  is built with `default-features = false` + `local,net,keyring`: no cloud
+  backend, and no `download-binaries` (it installs the runtime on the *build*
+  machine, useless for a released binary). The builder sets the writable overlay
+  (`root_disk`, `--disk` GiB, default 32) — this is the *only* place the
+  per-run disk ceiling can be set, because booting from the snapshot inherits
+  the snapshot's fixed-size `upper.ext4` and the SDK forbids resizing it at boot.
+  The default microsandbox overlay is just 4 GiB, which a large repo + vendor +
   node_modules + guest-local caches overruns (ENOSPC); ext4 is sparse, so a big
-  overlay costs almost nothing until used.
+  overlay costs almost nothing until used. Every boot goes through
+  `setup::base_builder` (`Sandbox::builder(name).override_snapshot(BASE_SNAPSHOT)`):
+  microsandbox 0.7's public `Sandbox::restore` has no `env` / `secret_entry` /
+  TLS / `replace` / attached mode, which every boxme boot needs, while the full
+  builder still resolves a snapshot source via the doc-hidden `override_snapshot`
+  (what the `msb` CLI uses for config-file snapshot sources). Re-check it on
+  each microsandbox bump.
 - `detect.rs` — resolves guest PHP `X.Y` and Node major: host binary run from the
   project dir first (so mise/asdf/herd shims resolve per-directory), then
   manifest constraints (`composer.json` require.php, `.nvmrc`, `engines.node`),
@@ -349,8 +362,9 @@ assumption; verify these on a real `boxme dev` run.
   walks the parsed JSON, swaps every `http-basic` password / `github-oauth` /
   `gitlab-*` / `bearer` token for a `__BOXME_COMPOSER_SECRET_N__` placeholder, and
   emits a `SecretEntry` per credential (`allowed_hosts` = `*.host`, github also
-  gets `*.githubusercontent.com`; token sections enable header/basic/query
-  injection, http-basic keeps the basic+header default; `require_tls_identity`
+  gets `*.githubusercontent.com`; token sections enable header + query
+  `SecretSubstitution`, http-basic keeps the header-only default (header
+  substitution also covers decoded `Authorization: Basic`); `require_tls_identity`
   on). `inject` is the shared entry point each path calls under its own gate:
   it pushes `COMPOSER_AUTH` (the placeholder JSON) and `NODE_EXTRA_CA_CERTS`
   (= `GUEST_TLS_CA_PATH`, so Node trusts the proxy CA — composer's PHP-curl and

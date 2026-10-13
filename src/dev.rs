@@ -29,7 +29,7 @@ use crate::run::{
     strict_policy,
 };
 use crate::scripts;
-use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
+use crate::setup::{base_builder, base_snapshot_exists, BASE_SNAPSHOT};
 use crate::util::{project_slug, stream_shell_stderr, tar_directory};
 
 /// Forwarded by default when no `--port` is given: artisan serve + Vite.
@@ -118,8 +118,7 @@ async fn boot_dev(
     secrets: &[SecretEntry],
 ) -> Result<Sandbox> {
     eprintln!("{} '{name}' from {BASE_SNAPSHOT}...", ">> booting".dimmed());
-    let mut builder = Sandbox::builder(name)
-        .from_snapshot(BASE_SNAPSHOT)
+    let mut builder = base_builder(name)
         .memory(cli.memory)
         .cpus(cli.cpus)
         .replace()

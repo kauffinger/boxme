@@ -22,7 +22,7 @@ use crate::outside::{self, OutsideScan};
 use crate::report;
 use crate::review::{self, Decision, FileItem, FileKind, NetRow, NetStatus, Review};
 use crate::scripts;
-use crate::setup::{base_snapshot_exists, BASE_SNAPSHOT};
+use crate::setup::{base_builder, base_snapshot_exists, BASE_SNAPSHOT};
 use crate::util::{project_slug, shell_capture, shell_quote, stream_shell_stderr};
 
 /// Fetching a unified diff per unexpected file is one guest exec each — cap it.
@@ -945,8 +945,7 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
     // in the guest-local overlay upper instead.
     let project_dir =
         std::fs::canonicalize(ctx.project_dir).unwrap_or_else(|_| ctx.project_dir.to_path_buf());
-    let mut builder = Sandbox::builder(name.as_str())
-        .from_snapshot(BASE_SNAPSHOT)
+    let mut builder = base_builder(name.as_str())
         .memory(ctx.cli.memory)
         .cpus(ctx.cli.cpus)
         .replace()

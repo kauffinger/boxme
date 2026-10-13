@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use microsandbox::sandbox::SandboxStatus;
+use microsandbox::sandbox::{SandboxHandle, SandboxStatus, MAX_SANDBOX_LIST_LIMIT};
 use microsandbox::Sandbox;
 use owo_colors::OwoColorize;
 use serde::Serialize;
@@ -14,6 +14,30 @@ use serde::Serialize;
 use crate::run::quote_args;
 use crate::setup::BUILDER;
 use crate::util::{project_slug, stream_shell_split};
+
+/// Every sandbox microsandbox knows about. `Sandbox::list` returns one page
+/// (20 by default), so walk the cursor — `ps` and `kill --all` must not miss a
+/// VM just because the host has many.
+async fn list_all() -> Result<Vec<SandboxHandle>> {
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = Sandbox::list_with(|l| {
+            let l = l.limit(MAX_SANDBOX_LIST_LIMIT);
+            match cursor.take() {
+                Some(c) => l.cursor(c),
+                None => l,
+            }
+        })
+        .await
+        .context("listing sandboxes")?;
+        all.extend(page.sandboxes);
+        let Some(next) = page.next_cursor else {
+            return Ok(all);
+        };
+        cursor = Some(next);
+    }
+}
 
 /// Which of boxme's name shapes a sandbox matches. Everything boxme boots is
 /// classified here; sandboxes from other tools never are — which is what lets
@@ -82,9 +106,8 @@ pub async fn ps(json: bool) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let rows: Vec<VmRow> = Sandbox::list()
-        .await
-        .context("listing sandboxes")?
+    let rows: Vec<VmRow> = list_all()
+        .await?
         .iter()
         .filter_map(|h| {
             let kind = classify(h.name())?;
@@ -163,9 +186,8 @@ pub async fn exec(vm: Option<&str>, cmd: &[String]) -> Result<i32> {
 /// delete another tool's sandbox on a typo.
 pub async fn kill(names: &[String], all: bool) -> Result<()> {
     let targets: Vec<String> = if all {
-        Sandbox::list()
-            .await
-            .context("listing sandboxes")?
+        list_all()
+            .await?
             .iter()
             .map(|h| h.name().to_string())
             .filter(|n| classify(n).is_some())
@@ -233,9 +255,8 @@ async fn connect_target(vm: Option<&str>) -> Result<(String, Sandbox)> {
 async fn running_for_folder(dir: &Path) -> Result<Vec<String>> {
     let dev_name = crate::dev::dev_vm_name(dir);
     let slug = project_slug(dir);
-    Ok(Sandbox::list()
-        .await
-        .context("listing sandboxes")?
+    Ok(list_all()
+        .await?
         .iter()
         .filter(|h| matches!(h.status_snapshot(), SandboxStatus::Running))
         .map(|h| h.name().to_string())
