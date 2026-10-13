@@ -32,10 +32,10 @@ async fn list_all() -> Result<Vec<SandboxHandle>> {
         .await
         .context("listing sandboxes")?;
         all.extend(page.sandboxes);
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(all),
-        }
+        let Some(next) = page.next_cursor else {
+            return Ok(all);
+        };
+        cursor = Some(next);
     }
 }
 

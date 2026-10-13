@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use microsandbox::sandbox::{SandboxBuilder, SandboxStatus};
-use microsandbox::setup::{self, InstallOptions};
+use microsandbox::setup::{
+    install_runtime, resolve_runtime, resolve_runtime_version, InstallOptions,
+};
 use microsandbox::{Sandbox, Snapshot};
 
 use crate::scripts::BASE_SETUP;
@@ -41,15 +43,15 @@ async fn ensure_runtime() -> Result<()> {
     eprintln!("Ensuring microsandbox runtime (libkrun + msb) is installed...");
     let config = microsandbox::config::config().context("loading the microsandbox config")?;
     let options = InstallOptions::default();
-    if let Ok(runtime) = setup::resolve_runtime(&config) {
-        let installed = setup::resolve_runtime_version(&runtime.msb_path)
-            .ok()
-            .flatten();
-        if installed.is_some_and(|v| v.to_string() == options.version) {
-            return Ok(());
-        }
+    // Any lookup failure (absent, partial, unreadable) falls through to a
+    // forced reinstall, which is also what repairs a partial install.
+    let installed = resolve_runtime(&config)
+        .ok()
+        .and_then(|runtime| resolve_runtime_version(runtime.msb_path).ok().flatten());
+    if installed.is_some_and(|v| v.to_string() == options.version) {
+        return Ok(());
     }
-    setup::install_runtime(
+    install_runtime(
         &config,
         InstallOptions {
             force: true,
