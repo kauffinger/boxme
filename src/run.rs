@@ -16,9 +16,11 @@ use crate::cli::Cli;
 use crate::composer_auth;
 use crate::copyback::{self, CopyPlan};
 use crate::detect;
+use crate::dns;
 use crate::manifest::{self, Change, WriteSet};
 use crate::netcap::{self, NetworkContact};
 use crate::outside::{self, OutsideScan};
+use crate::packages::{self, PackageChange};
 use crate::report;
 use crate::review::{self, Decision, FileItem, FileKind, NetRow, NetStatus, Review};
 use crate::scripts;
@@ -49,6 +51,8 @@ struct CommandRun {
     /// File counts per expected write-set dir (vendor/, node_modules/), for the
     /// JSON report — the TUI renders them from `files` summary rows instead.
     dir_counts: Vec<(String, u64)>,
+    /// Package versions the changed lockfiles moved, across every manager.
+    packages: Vec<PackageChange>,
 }
 
 /// What an enforced review resolves to.
@@ -308,6 +312,7 @@ fn build_report(
             })
             .collect(),
         files,
+        packages: run.packages.clone(),
         network: report::Network {
             banner: run.network_banner.clone(),
             contacts,
@@ -433,6 +438,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<i32> {
         remove_vm(sb, &name).await;
         copyback::commit(ctx.project_dir, staged?)?;
         eprintln!("{}", "approved — results copied into the project".green());
+        print_package_summary(&run.packages);
         return Ok(run.exit_code);
     }
 
@@ -457,22 +463,24 @@ async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> 
     let outcome = async {
         let run = run_command(&sb, ctx).await?;
         let exit_code = run.exit_code;
+        let changed_packages = run.packages.clone();
         let after = finish_review(&sb, ctx, run, &allow, can_trust).await?;
-        Ok::<_, anyhow::Error>((after, exit_code))
+        Ok::<_, anyhow::Error>((after, exit_code, changed_packages))
     }
     .await;
     remove_vm(sb, &name).await;
 
     match outcome? {
-        (AfterReview::Approved(staged), exit_code) => {
+        (AfterReview::Approved(staged), exit_code, changed_packages) => {
             // VM is down now, so the project is no longer a live overlay lower —
             // safe to mutate the host tree.
             copyback::commit(ctx.project_dir, staged)?;
             eprintln!("{}", "approved — results copied into the project".green());
+            print_package_summary(&changed_packages);
             Ok(exit_code)
         }
-        (AfterReview::Aborted, _) => Ok(EXIT_ABORTED),
-        (AfterReview::Rerun(merged), _) => {
+        (AfterReview::Aborted, ..) => Ok(EXIT_ABORTED),
+        (AfterReview::Rerun(merged), ..) => {
             eprintln!(
                 "{}",
                 ">> re-running clean under the updated allowlist".dimmed()
@@ -587,6 +595,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     // Manifest after + diff, partitioned expected vs unexpected.
     let after = manifest::parse(&shell_capture(sb, scripts::MANIFEST).await?);
     let changes = manifest::diff(&before, &after);
+    let packages = package_changes(sb, ctx.project_dir, &changes).await;
 
     // Sweep for anything the command wrote outside /workspace.
     let outside = match shell_capture(sb, &scripts::outside_scan(!ctx.secrets.is_empty())).await {
@@ -608,6 +617,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
                 label: format!("{dir}/: {count} files"),
                 kind: FileKind::ExpectedSummary,
                 diff: None,
+                packages: Vec::new(),
             });
         }
     }
@@ -621,6 +631,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
                 label: path.clone(),
                 kind: FileKind::ExpectedFile,
                 diff: fetch_diff(sb, path, change).await,
+                packages: lockfile_packages(&packages, path),
             });
         } else {
             unexpected.push((path.clone(), *change));
@@ -649,6 +660,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
             label: path.clone(),
             kind,
             diff,
+            packages: lockfile_packages(&packages, path),
         });
     }
 
@@ -663,7 +675,66 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
         expected_files,
         unexpected,
         dir_counts,
+        packages,
     })
+}
+
+/// The package changes behind every lockfile the run touched: the host copy is
+/// the before (the project is the read-only lower, untouched by the run), the
+/// guest's `/workspace` copy the after. A lockfile either side can't parse
+/// contributes nothing rather than a misleading list.
+async fn package_changes(
+    sb: &Sandbox,
+    project_dir: &Path,
+    changes: &[(String, Change)],
+) -> Vec<PackageChange> {
+    let mut all = Vec::new();
+    for (lockfile, manager) in packages::LOCKFILES {
+        if !changes.iter().any(|(path, _)| path == lockfile) {
+            continue;
+        }
+        let before = std::fs::read_to_string(project_dir.join(lockfile)).unwrap_or_default();
+        let after = shell_capture(
+            sb,
+            &format!("cat /workspace/{lockfile} 2>/dev/null || true"),
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(changed) = packages::diff_lockfiles(manager, &before, &after) {
+            all.extend(changed);
+        }
+    }
+    all
+}
+
+/// The changes to show next to `path` in the review, if it is a lockfile.
+fn lockfile_packages(changes: &[PackageChange], path: &str) -> Vec<PackageChange> {
+    let Some((_, manager)) = packages::LOCKFILES
+        .iter()
+        .find(|(lockfile, _)| *lockfile == path)
+    else {
+        return Vec::new();
+    };
+    changes
+        .iter()
+        .filter(|c| c.manager == *manager)
+        .cloned()
+        .collect()
+}
+
+/// One line per package manager after an approved run, so the terminal keeps a
+/// record of what the update did once the review is gone.
+fn print_package_summary(changes: &[PackageChange]) {
+    for (_, manager) in packages::LOCKFILES {
+        let changed: Vec<PackageChange> = changes
+            .iter()
+            .filter(|c| c.manager == *manager)
+            .cloned()
+            .collect();
+        if !changed.is_empty() {
+            eprintln!("   {}", packages::summary(manager, &changed));
+        }
+    }
 }
 
 /// Review of a finished enforced run. Copies back on approval, aborts on quit,
@@ -959,6 +1030,7 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
     let project_dir =
         std::fs::canonicalize(ctx.project_dir).unwrap_or_else(|_| ctx.project_dir.to_path_buf());
     let mut builder = base_builder(name.as_str())
+        .await?
         .memory(ctx.cli.memory)
         .cpus(ctx.cli.cpus)
         .replace()
@@ -970,7 +1042,20 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
     for entry in &ctx.secrets {
         builder = builder.secret_entry(entry.clone());
     }
-    builder = builder.network(|n| n.policy(policy));
+    // microsandbox 0.7.8 turned on `strict` hostname policy by default, which
+    // denies a TLS connection allowed by a domain rule unless the TLS is
+    // intercepted — every HTTPS request to a registry dies after the
+    // ClientHello. boxme's enforcement is the SNI + DNS-binding check that
+    // non-strict mode keeps; intercepting every run instead would also mean
+    // pruning the CA store from the outside scan, hiding a rogue CA install.
+    let dns_relay = dns::relay().await;
+    builder = builder.network(|n| {
+        let n = n.policy(policy).strict(false);
+        match dns_relay {
+            Some(relay) => n.dns(|d| d.nameservers([relay])),
+            None => n,
+        }
+    });
     for (key, value) in &ctx.env {
         builder = builder.env(key, value);
     }

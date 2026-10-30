@@ -11,6 +11,7 @@ use owo_colors::OwoColorize;
 use serde::Serialize;
 
 use crate::copyback;
+use crate::packages::PackageChange;
 
 /// Where a `--json` run stages its changeset, relative to the project dir.
 /// The dir carries a `*` .gitignore so it can never be committed by accident.
@@ -45,6 +46,9 @@ pub struct Report {
     pub expected_dirs: Vec<DirSummary>,
     /// Every other changed path, with its diff where one was captured.
     pub files: Vec<FileChange>,
+    /// Package versions that changed, read from the lockfiles before and
+    /// after the run: what an update actually updated.
+    pub packages: Vec<PackageChange>,
     pub network: Network,
     pub outside: Outside,
     /// Present when a changeset was staged: where it is and how to decide on it.
@@ -259,6 +263,7 @@ mod tests {
             findings: vec![],
             expected_dirs: vec![],
             files: vec![],
+            packages: vec![],
             network: Network {
                 banner: None,
                 contacts: vec![],

@@ -122,7 +122,7 @@ git config --global --add safe.directory /workspace
 git config --global core.hooksPath /dev/null
 git init -q
 git add -Af -- . ':(exclude).git' ':(exclude)vendor' ':(exclude)node_modules'
-git -c user.email=boxme@local -c user.name=boxme commit --no-verify -qm "boxme baseline" || true
+git -c user.email=boxme@local -c user.name=boxme commit --allow-empty --no-verify -qm "boxme baseline"
 git tag -f boxme-baseline HEAD >/dev/null
 echo ">> project mounted (overlay), baseline tagged"
 "#;
@@ -244,14 +244,15 @@ pub const BASELINE_MARKER: &str = "/root/.boxme-outside-baseline";
 /// agentd writes /etc/hosts, /etc/hostname and /etc/resolv.conf on its own
 /// schedule, which races the baseline marker, and `/.msb` is the agent's
 /// runtime dir. When TLS interception is on (`--composer-auth`) the agent also
-/// installs the proxy CA into the guest trust store, so those paths are pruned
-/// too — but only then, so a rogue CA install by a postinstall script still
+/// installs the proxy CA into the guest trust stores (Debian's and the
+/// RHEL-style `/etc/pki`), so those paths are pruned too — but only then, so a rogue CA install by a postinstall script still
 /// shows up in a normal run. Trading a little blind spot in those for signal
 /// in the rest of the tree. Output is `size\ttype\tpath`; a missing marker
 /// prints `#NOMARKER`.
 pub fn outside_scan(tls_intercepting: bool) -> String {
     let ca_prunes = if tls_intercepting {
-        " -o -path /etc/ssl/certs -o -path /usr/local/share/ca-certificates \\
+        " -o -path /etc/ssl/certs -o -path /etc/ssl/cert.pem -o -path /etc/pki \\
+     -o -path /usr/local/share/ca-certificates \\
      -o -path /etc/ca-certificates.conf -o -path /etc/ca-certificates"
     } else {
         ""
@@ -306,8 +307,22 @@ mod tests {
             }
         }
         // The trust store is pruned only under TLS interception, so a rogue CA
-        // install still shows up in a normal run.
-        assert!(outside_scan(true).contains("-path /etc/ssl/certs"));
-        assert!(!outside_scan(false).contains("-path /etc/ssl/certs"));
+        // install still shows up in a normal run. Every store the guest agent
+        // writes its CA into is covered, Debian's and the RHEL-style /etc/pki.
+        for path in [
+            "/etc/ssl/certs",
+            "/etc/ssl/cert.pem",
+            "/etc/pki",
+            "/usr/local/share/ca-certificates",
+        ] {
+            assert!(
+                outside_scan(true).contains(&format!("-path {path}")),
+                "{path}"
+            );
+            assert!(
+                !outside_scan(false).contains(&format!("-path {path}")),
+                "{path}"
+            );
+        }
     }
 }

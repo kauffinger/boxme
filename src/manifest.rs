@@ -151,13 +151,36 @@ pub fn expected_write_set_all(commands: &[Vec<String>]) -> WriteSet {
 
 /// Expected write-set per command. `tool` is "composer" or "npm";
 /// `args` everything after it.
+///
+/// Every composer command may also write `composer-integrity.lock` (the
+/// base image's soak-time plugin records each installed version there, to be
+/// committed next to composer.lock) and Laravel's `bootstrap/cache` package
+/// manifests, which `package:discover` regenerates from `vendor/` on every
+/// autoload dump.
 pub fn expected_write_set(tool: &str, args: &[String]) -> WriteSet {
     match tool {
         "composer" => {
-            let mutates_json = args
-                .first()
-                .is_some_and(|sub| matches!(sub.as_str(), "require" | "remove" | "update" | "up"));
-            let mut files = vec!["composer.lock"];
+            let mutates_json = args.first().is_some_and(|sub| {
+                matches!(
+                    sub.as_str(),
+                    "require"
+                        | "r"
+                        | "remove"
+                        | "rm"
+                        | "uninstall"
+                        | "update"
+                        | "u"
+                        | "up"
+                        | "upgrade"
+                        | "bump"
+                )
+            });
+            let mut files = vec![
+                "composer.lock",
+                "composer-integrity.lock",
+                "bootstrap/cache/packages.php",
+                "bootstrap/cache/services.php",
+            ];
             if mutates_json {
                 files.push("composer.json");
             }
@@ -171,9 +194,10 @@ pub fn expected_write_set(tool: &str, args: &[String]) -> WriteSet {
             let has_pkg_args = args.iter().skip(1).any(|a| !a.starts_with('-'));
             // `npm install <pkg>`, uninstall and update rewrite package.json;
             // a bare `npm install` / `npm ci` only the lockfile.
-            let mutates_json =
-                matches!(sub, "uninstall" | "remove" | "rm" | "un" | "update" | "up")
-                    || (matches!(sub, "install" | "i" | "add") && has_pkg_args);
+            let mutates_json = matches!(
+                sub,
+                "uninstall" | "remove" | "rm" | "un" | "update" | "up" | "upgrade"
+            ) || (matches!(sub, "install" | "i" | "add") && has_pkg_args);
             let mut files = vec!["package-lock.json"];
             if mutates_json {
                 files.push("package.json");
@@ -250,14 +274,63 @@ mod tests {
 
         let ws = expected_write_set_all(&[cmd(&["composer", "install"]), cmd(&["npm", "ci"])]);
         assert_eq!(ws.dirs, vec!["vendor", "node_modules"]);
-        assert_eq!(ws.files, vec!["composer.lock", "package-lock.json"]);
+        assert!(ws.contains("composer.lock") && ws.contains("package-lock.json"));
+        assert!(!ws.contains("composer.json") && !ws.contains("package.json"));
 
         // Overlapping sets dedupe; a segment widening the set (update mutates
         // composer.json) still contributes its extras.
         let ws =
             expected_write_set_all(&[cmd(&["composer", "install"]), cmd(&["composer", "update"])]);
         assert_eq!(ws.dirs, vec!["vendor"]);
-        assert_eq!(ws.files, vec!["composer.lock", "composer.json"]);
+        assert_eq!(
+            ws.files.iter().filter(|f| **f == "composer.lock").count(),
+            1
+        );
+        assert!(ws.contains("composer.json"));
+    }
+
+    #[test]
+    fn composer_write_set_covers_what_an_update_legitimately_regenerates() {
+        let args = |tokens: &[&str]| tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+
+        // Any composer command: the soak-time integrity lock and Laravel's
+        // package manifests are regenerated alongside composer.lock.
+        let install = expected_write_set("composer", &args(&["install"]));
+        for path in [
+            "composer.lock",
+            "composer-integrity.lock",
+            "bootstrap/cache/packages.php",
+            "bootstrap/cache/services.php",
+            "vendor/autoload.php",
+        ] {
+            assert!(install.contains(path), "{path} should be expected");
+        }
+        assert!(!install.contains("composer.json"));
+        assert!(!install.contains("bootstrap/cache/config.php"));
+        assert!(!install.contains("app/Providers/AppServiceProvider.php"));
+
+        // Every alias of a command that rewrites composer.json, plus `bump`.
+        for sub in [
+            "update",
+            "u",
+            "up",
+            "upgrade",
+            "require",
+            "r",
+            "remove",
+            "rm",
+            "uninstall",
+            "bump",
+        ] {
+            assert!(
+                expected_write_set("composer", &args(&[sub])).contains("composer.json"),
+                "composer {sub} rewrites composer.json"
+            );
+        }
+        for sub in ["update", "up", "upgrade"] {
+            assert!(expected_write_set("npm", &args(&[sub])).contains("package.json"));
+        }
+        assert!(!expected_write_set("npm", &args(&["ci"])).contains("package.json"));
     }
 
     #[test]

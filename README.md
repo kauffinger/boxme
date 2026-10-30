@@ -17,7 +17,25 @@ command runs fully interactively, then a review TUI shows three tabs: **Files**
 (expected writes like `vendor/` summarized, everything else itemized with
 diffs), **Network** (every destination, registry vs unexpected), **Outside**
 (writes outside `/workspace` — reported, never copied back). `a` applies, `q`
-aborts and nothing lands. The base image also blocks dependencies younger than
+aborts and nothing lands.
+
+Updates read as package changes, not lockfile JSON: the `composer.lock` /
+`package-lock.json` row opens with every version the run moved — counted by
+kind, majors and downgrades in red — above the raw diff. Below 1.0 a minor bump
+counts as major, the way `^` treats it (`^0.1` stops before 0.2). An excerpt
+from a real `composer update` of a Laravel 12 app:
+
+```
+104 composer packages changed: 12 major, 66 minor, 23 patch, 3 added
+
+composer/pcre                + 3.4.0     added
+laravel/framework   v12.25.0 → v12.70.2  minor
+laravel/mcp           v0.1.1 → v0.5.9    major
+symfony/console       v7.3.2 → v7.4.21   minor
+symfony/string        v7.3.2 → v8.1.9    major
+```
+
+After you approve, the same one-line summary stays in your terminal. The base image also blocks dependencies younger than
 7 days (composer `innobrain/soak-time`, npm `min-release-age=7`).
 
 ## Install
@@ -92,8 +110,13 @@ boxme allow some-host.com       # trust a blocked host without the TUI, then re-
 
 Step 1 always enforces (registries + `.boxme/allow`), streams command output to
 stderr, and prints a report to stdout: changed files with diffs (expected vs
-unexpected), network contacts (`registry`/`allowed`/`blocked`), outside writes,
-guest exit code. The changeset is a plain gzipped tar under `.boxme/pending/`
+unexpected), the package versions that changed (`packages`: name, from, to,
+and `major`/`minor`/`patch`/`downgrade`/`changed`/`added`/`removed`), network
+contacts (`registry`/`allowed`/`blocked`), outside writes, guest exit code.
+What an update legitimately regenerates — the lockfiles,
+`composer-integrity.lock` (soak-time), Laravel's
+`bootstrap/cache/{packages,services}.php` — counts as expected, so a clean
+`composer update` exits `0`. The changeset is a plain gzipped tar under `.boxme/pending/`
 (self-gitignored, report kept next to it); the report's `pending` object
 carries the apply/discard commands so an agent needs no docs.
 
@@ -142,6 +165,13 @@ There is no mid-run "allow? [y/n]" (the policy is fixed at boot) and no
 path-level rules (the URL path lives inside TLS — only the hostname is
 visible).
 
+The sandbox's DNS goes through a small relay in boxme that forwards to your
+resolvers (`/etc/resolv.conf`) and raises short TTLs to 10 minutes. An allowed
+host is reachable only at an IP its DNS answer named, and only while that
+answer is valid — composer and npm cache addresses longer than many resolvers
+keep them, so without the relay a long install could lose its connection
+mid-download.
+
 ### Review keys
 
 `↑↓`/`jk` select · `g`/`G` first/last · `h`/`l`/`Tab` or `1`/`2`/`3` switch
@@ -167,6 +197,11 @@ a reflexive press can't abort a run.
   no shared cache a malicious package could poison. Only the Node-versions
   volume is shared across projects.
 - Approval is all-or-nothing.
+- Composer refuses versions with known advisories, and soak-time holds back
+  releases younger than 7 days (security fixes: 72 h). While a dependency's fix
+  is that fresh, `composer update` can't resolve at all;
+  `boxme composer update --no-security-blocking` updates everything else in
+  the meantime.
 - A nonzero exit from the command still shows the review (red banner).
 - `BOXME_DEBUG_NET=/path/file.txt` dumps the raw in-guest `tcpdump -r` text
   behind the Network tab.
