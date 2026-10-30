@@ -46,7 +46,6 @@ boxme composer require foo/bar
 boxme npm ci
 boxme --strict composer install     # registries only, allowlist ignored
 boxme --learn composer install      # re-open the host picker
-boxme --keep npm install            # keep the VM after the run
 boxme --memory 4096 --cpus 4 composer update
 boxme -e NPM_TOKEN=xyz npm install  # env into the guest — visible to package code
 boxme -a composer install           # --composer-auth: credentials the guest can't read
@@ -62,6 +61,10 @@ Existing `vendor/` and `node_modules/` stay visible, so incremental commands do
 incremental work. For a clean install, remove them on the host first or use
 `npm ci`.
 
+boxme exits with the wrapped command's own exit code, so
+`boxme composer install && php artisan migrate` stops when composer failed
+inside the box. Aborting the review exits `1`.
+
 ### Private composer repos (`--composer-auth`, `-a`)
 
 `-e COMPOSER_AUTH` hands raw tokens to every postinstall script. `-a` reads
@@ -73,7 +76,7 @@ credential can travel exactly one place: the host it already authenticates.
 
 The host still has to be reachable under the network policy (`.boxme/allow`);
 `github.com` is a built-in registry, so a `github-oauth` token works right
-away. Also applies to `boxme claude` and `boxme dev`; npm runs ignore it.
+away. npm runs ignore the flag.
 
 ## Non-interactive mode (agents, scripts, CI)
 
@@ -98,74 +101,6 @@ Exit codes: `0` clean (safe to `boxme apply`) · `1` boxme failed · `2` the
 command failed (nothing staged) · `3` findings — blocked hosts, unexpected
 files, outside writes — listed in `findings` for a script to branch on.
 
-## Dev server
-
-`boxme dev` runs your dev stack **inside** the sandbox and forwards its ports.
-Dependencies install in the guest (Linux-native binaries — no host/Linux
-`node_modules` mismatch), your edits sync one-way host→guest so Vite/HMR sees
-them live, and nothing the guest writes ever comes back. Ctrl-C tears it down.
-
-```sh
-boxme dev                              # composer run dev, ports 8000 + 5173
-boxme dev npm run dev
-boxme dev -p 3000 -p 5173 npm run dev  # custom ports (HOST or HOST:GUEST)
-```
-
-Guest-owned paths aren't synced: `node_modules`, `vendor`, `.git`, `storage`,
-`bootstrap/cache`, `public/build`, `public/hot`. Servers that bind only
-loopback (artisan serve, Vite) are bridged automatically. One VM per folder;
-several repos at once work, and a busy host port bumps to the next free one.
-The network policy still applies — without an allowlist, egress is open but
-recorded.
-
-The database lives in the guest, so run migrations there — attach a second
-shell from another terminal in the same folder:
-
-```sh
-boxme attach                       # interactive shell in /workspace
-boxme attach php artisan migrate   # one command and exit
-```
-
-## Claude Code agent
-
-`boxme claude` runs Claude Code inside the sandbox, then copies exactly what it
-changed into your working tree as plain uncommitted edits — review with
-`git diff`, commit or `git checkout .`. Works on a dirty tree, or a directory
-that isn't a git repo at all.
-
-```sh
-boxme claude                        # interactive session (permission mode: auto)
-boxme claude 'fix the failing test' # headless one-shot (checks bypassed — the sandbox is the boundary)
-```
-
-If the agent changed a file you'd **also** edited locally, boxme stops and
-asks: overwrite, put the work on a `boxme/claude-<n>` branch, or abort. A
-headless run branches automatically. The branch is built in a throwaway
-worktree at `HEAD` — "HEAD + exactly what the agent did", your working tree
-untouched.
-
-### Authentication
-
-There is no browser login inside the box (only Anthropic's API hosts are
-reachable), so authenticate with a token:
-
-```sh
-claude setup-token   # OAuth on the host, prints a 1-year token
-boxme login          # stored in your keychain (Linux: 0600 file), never a dotfile
-```
-
-Resolution order: `-e` flag → shell `CLAUDE_CODE_OAUTH_TOKEN` /
-`ANTHROPIC_API_KEY` → the saved token; the token is injected into the guest
-env only. With none, `boxme claude` fails before booting. Network enforcement
-is the exfil mitigation: only `anthropic.com` / `claude.com` plus the package
-registries are reachable, so a leaked token can't be sent anywhere else. (A
-copied subscription login is not reused — its access token expires within
-hours and the refresh flow doesn't work headless.)
-
-`boxme --learn claude '…'` observes with open egress and saves contacted hosts
-to `.boxme/claude-allow` — kept separate from `.boxme/allow` so the two
-surfaces can't inherit each other's reachability. `--strict` drops the extras.
-
 ## Fleet skills: sweeping many repos
 
 `boxme skills` installs two bundled Claude Code skills into `~/.claude/skills`:
@@ -179,24 +114,6 @@ surfaces can't inherit each other's reachability. `--strict` drops the extras.
 Every install runs sandboxed; only clean changesets are applied automatically.
 
 [innobrain/composer-fix]: https://packagist.org/packages/innobrain/composer-fix
-
-## Kept VMs and housekeeping
-
-`--keep` leaves the VM running after a run — useful for autopsy when something
-failed. `boxme claude` also keeps the VM automatically if copying the result
-out fails.
-
-```sh
-boxme --json --keep composer update   # failed run stays up
-boxme ps                              # list boxme's VMs (--json for scripts)
-boxme attach [--vm NAME]              # shell into this folder's running VM
-boxme exec composer why-not php 8.4   # one command, split streams, exit code propagated
-boxme kill boxme-app-3f2a             # stop + remove
-boxme kill --all                      # sweep every boxme VM
-```
-
-`kill` only accepts boxme's own VM names, so it can't remove another tool's
-sandbox on a typo.
 
 ## Network policy
 

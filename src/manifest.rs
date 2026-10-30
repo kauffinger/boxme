@@ -1,20 +1,24 @@
 use std::collections::BTreeMap;
 
 /// One /workspace entry from the guest manifest. Files carry an md5 so mtime
-/// noise can't show up as a change.
+/// noise can't show up as a change; symlinks carry their target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub kind: char, // f / d / l from find's %y
     pub size: u64,
+    /// The link target for a symlink, empty for everything else.
+    pub link_target: String,
     pub md5: Option<String>,
 }
 
 pub type Manifest = BTreeMap<String, Entry>;
 
 /// Parse the output of `scripts::MANIFEST`: NUL-delimited records, a `#FILES`
-/// section of `size\ttype\tpath` then a `#MD5` section of `hash  /workspace/path`
-/// (from `md5sum -z`). The path is the record's last field, so tabs or newlines
-/// in a filename stay part of the path instead of forging extra records.
+/// section of `size\ttype\tlink-target\tpath` then a `#MD5` section of
+/// `hash  /workspace/path` (from `md5sum -z`). The path is the record's last
+/// field, so tabs or newlines in a filename stay part of the path instead of
+/// forging extra records. (A tab in a link *target* would shift the path, but
+/// that only garbles the symlink's own entry, never another file's.)
 pub fn parse(output: &str) -> Manifest {
     let mut manifest = Manifest::new();
     let mut in_md5 = false;
@@ -41,9 +45,9 @@ pub fn parse(output: &str) -> Manifest {
                 }
             }
             _ => {
-                let mut parts = record.splitn(3, '\t');
-                let (Some(size), Some(kind), Some(path)) =
-                    (parts.next(), parts.next(), parts.next())
+                let mut parts = record.splitn(4, '\t');
+                let (Some(size), Some(kind), Some(link_target), Some(path)) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
                 else {
                     continue;
                 };
@@ -55,6 +59,7 @@ pub fn parse(output: &str) -> Manifest {
                     Entry {
                         kind: kind.chars().next().unwrap_or('f'),
                         size: size.parse().unwrap_or(0),
+                        link_target: link_target.to_string(),
                         md5: None,
                     },
                 );
@@ -64,7 +69,7 @@ pub fn parse(output: &str) -> Manifest {
     manifest
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Change {
     Added,
     Modified,
@@ -72,20 +77,22 @@ pub enum Change {
 }
 
 /// Host-side manifest diff. Files compare by md5 (or size when a hash is
-/// missing); directories and symlinks by existence + type only.
+/// missing), symlinks by target, directories by existence + type only.
 pub fn diff(before: &Manifest, after: &Manifest) -> Vec<(String, Change)> {
     let mut changes = Vec::new();
     for (path, entry) in after {
         match before.get(path) {
             None => changes.push((path.clone(), Change::Added)),
             Some(prev) => {
-                let modified = if entry.kind == 'f' && prev.kind == 'f' {
+                let modified = if prev.kind != entry.kind {
+                    true
+                } else if entry.kind == 'f' {
                     match (&prev.md5, &entry.md5) {
                         (Some(a), Some(b)) => a != b,
                         _ => prev.size != entry.size,
                     }
                 } else {
-                    prev.kind != entry.kind
+                    prev.link_target != entry.link_target
                 };
                 if modified {
                     changes.push((path.clone(), Change::Modified));
@@ -190,8 +197,9 @@ mod tests {
     #[test]
     fn parses_files_and_joins_md5() {
         let output = "#FILES\0\
-            12\tf\tcomposer.json\0\
-            4096\td\tsrc\0\
+            12\tf\t\tcomposer.json\0\
+            4096\td\t\tsrc\0\
+            7\tl\t../pkg/bin/x\tnode_modules/.bin/x\0\
             #MD5\0\
             d41d8cd98f00b204e9800998ecf8427e  /workspace/composer.json\0";
         let manifest = parse(output);
@@ -203,6 +211,37 @@ mod tests {
             Some("d41d8cd98f00b204e9800998ecf8427e")
         );
         assert_eq!(manifest.get("src").unwrap().kind, 'd');
+        let link = manifest.get("node_modules/.bin/x").unwrap();
+        assert_eq!(link.kind, 'l');
+        assert_eq!(link.link_target, "../pkg/bin/x");
+    }
+
+    #[test]
+    fn diff_flags_a_retargeted_symlink_and_a_kind_change() {
+        let entry = |kind: char, target: &str, md5: Option<&str>| Entry {
+            kind,
+            size: 1,
+            link_target: target.to_string(),
+            md5: md5.map(str::to_string),
+        };
+        let mut before = Manifest::new();
+        before.insert("link".to_string(), entry('l', "a", None));
+        before.insert("same".to_string(), entry('l', "a", None));
+        before.insert("file".to_string(), entry('f', "", Some("aa")));
+        let mut after = Manifest::new();
+        after.insert("link".to_string(), entry('l', "b", None));
+        after.insert("same".to_string(), entry('l', "a", None));
+        after.insert("file".to_string(), entry('l', "aa", None));
+
+        let mut changes = diff(&before, &after);
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![
+                ("file".to_string(), Change::Modified),
+                ("link".to_string(), Change::Modified),
+            ]
+        );
     }
 
     #[test]
@@ -226,7 +265,7 @@ mod tests {
         // A name containing a tab and a newline must not forge extra records or
         // truncate the path — it is the record's last field, NUL-delimited.
         let nasty = "weird\tname\nwith-breaks.txt";
-        let output = format!("#FILES\05\tf\t{nasty}\0");
+        let output = format!("#FILES\05\tf\t\t{nasty}\0");
         let manifest = parse(&output);
         assert_eq!(manifest.len(), 1);
         assert!(manifest.contains_key(nasty));

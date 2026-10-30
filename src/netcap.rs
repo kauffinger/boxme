@@ -32,15 +32,6 @@ pub const STRICT_DOMAINS: &[&str] = &[
     "nodejs.org",
 ];
 
-/// Hosts `boxme claude` must reach regardless of the per-project allowlist:
-/// Anthropic's services. `anthropic.com` covers the inference API
-/// (`api.anthropic.com`); `claude.com` covers `platform.claude.com`, which
-/// Claude Code v2 contacts at startup even with non-essential traffic disabled
-/// (telemetry/error reporting are still off via env in `scripts::claude_run`).
-/// Both are suffix matches, so every Anthropic-owned subdomain is reachable while
-/// third-party hosts stay denied.
-pub const CLAUDE_DOMAINS: &[&str] = &["anthropic.com", "claude.com"];
-
 #[derive(Debug, Clone)]
 pub struct NetworkContact {
     pub domain: Option<String>,
@@ -156,7 +147,9 @@ fn parse_tcpdump_text(text: &str) -> Vec<NetworkContact> {
             .position(|t| matches!(*t, "A?" | "AAAA?" | "HTTPS?" | "CNAME?"))
         {
             if let (Some(id), Some(name)) = (txn_id(&tokens), tokens.get(qpos + 1)) {
-                queries.insert(id, name.trim_end_matches('.').to_string());
+                // DNS names are case-insensitive; normalize so matching
+                // against the registry list and the allowlist is too.
+                queries.insert(id, name.trim_end_matches('.').to_ascii_lowercase());
             }
             continue;
         }
@@ -298,6 +291,18 @@ mod tests {
         let unknown = contacts.iter().find(|c| c.ip == "6.6.6.6").unwrap();
         assert!(unknown.domain.is_none());
         assert!(!unknown.known);
+    }
+
+    #[test]
+    fn dns_names_are_lowercased() {
+        let text = "\
+12:00:00.000000 eth0 Out IP 10.0.2.15.51234 > 10.0.2.3.53: 12345+ A? Repo.Packagist.ORG. (31)
+12:00:00.010000 eth0 In  IP 10.0.2.3.53 > 10.0.2.15.51234: 12345 1/0/0 A 142.44.161.219 (47)
+12:00:00.020000 eth0 Out IP 10.0.2.15.40000 > 142.44.161.219.443: Flags [S], seq 1, win 64240, length 0
+";
+        let contacts = parse_tcpdump_text(text);
+        assert_eq!(contacts[0].domain.as_deref(), Some("repo.packagist.org"));
+        assert!(contacts[0].known);
     }
 
     #[test]

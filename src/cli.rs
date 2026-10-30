@@ -35,10 +35,6 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Keep the VM running after the run instead of removing it.
-    #[arg(long, global = true)]
-    pub keep: bool,
-
     /// Guest memory in MiB.
     #[arg(long, global = true, default_value_t = 2048)]
     pub memory: u32,
@@ -70,110 +66,6 @@ pub enum Command {
         #[arg(long, default_value_t = 32)]
         disk: u32,
     },
-    /// Run a dev-server stack (default `composer run dev`) inside the sandbox,
-    /// syncing host edits in one-way so HMR works without the guest ever writing
-    /// to your machine. Forwards guest ports back to the host.
-    Dev {
-        /// Forward a guest port to the host: `HOST:GUEST`, or a bare `PORT` for
-        /// both sides. Repeatable. Defaults to 8000 and 5173.
-        #[arg(long, short = 'p', value_name = "[HOST:]GUEST")]
-        port: Vec<String>,
-
-        /// The command to run inside the guest. Defaults to `composer run dev`.
-        /// Put it after the flags: `boxme dev -p 3000 npm run dev`.
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "COMMAND"
-        )]
-        cmd: Vec<String>,
-    },
-
-    /// Open a shell — or run a one-off command — inside a running boxme VM:
-    /// the current folder's dev session or kept run VM, or any VM via --vm.
-    /// E.g. `boxme attach`, `boxme attach php artisan migrate`,
-    /// `boxme attach --vm boxme-app-3f2a`.
-    Attach {
-        /// Target VM name (see `boxme ps`). Defaults to the current folder's
-        /// single running VM.
-        #[arg(long, value_name = "NAME")]
-        vm: Option<String>,
-
-        /// Command to run in the VM. Defaults to an interactive shell.
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "COMMAND"
-        )]
-        cmd: Vec<String>,
-    },
-
-    /// Run a single command inside a running boxme VM without a TTY: guest
-    /// stdout/stderr stay separate streams and the command's exit code becomes
-    /// boxme's. The scriptable counterpart of `attach` — for agents and scripts
-    /// inspecting a kept VM, e.g. `boxme exec git diff` or
-    /// `boxme exec --vm boxme-app-3f2a ls vendor`.
-    Exec {
-        /// Target VM name (see `boxme ps`). Defaults to the current folder's
-        /// single running VM.
-        #[arg(long, value_name = "NAME")]
-        vm: Option<String>,
-
-        /// Command to run in the VM, from /workspace.
-        #[arg(
-            required = true,
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "COMMAND"
-        )]
-        cmd: Vec<String>,
-    },
-
-    /// List boxme's VMs — dev sessions, kept run/claude VMs, the setup
-    /// builder — with status and age. With the global --json flag, prints a
-    /// JSON array instead.
-    Ps,
-
-    /// Stop and remove boxme VMs by name, or every one with --all. Cleans up
-    /// kept VMs (--keep, or a failed copy-out) that outlived their run. Only
-    /// boxme's own VMs can be removed.
-    Kill {
-        /// VM names from `boxme ps`.
-        #[arg(
-            value_name = "NAME",
-            required_unless_present = "all",
-            conflicts_with = "all"
-        )]
-        names: Vec<String>,
-
-        /// Remove every boxme VM, running or not.
-        #[arg(long)]
-        all: bool,
-    },
-
-    /// Run Claude Code inside the sandbox in full autonomy
-    /// (`--dangerously-skip-permissions`), then commit exactly what it changed
-    /// onto a fresh `boxme/claude-<n>` branch you can diff and merge. Give a prompt
-    /// for a one-shot headless run, or omit it for an interactive session:
-    /// `boxme claude` or `boxme claude 'fix the failing test'`.
-    Claude {
-        /// One-shot prompt (headless). Omit for an interactive session. Put it
-        /// after the global flags: `boxme --learn claude 'upgrade to PHP 8.4'`.
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "PROMPT"
-        )]
-        prompt: Vec<String>,
-    },
-
-    /// Save the Claude Code OAuth token (from `claude setup-token`) to your system
-    /// keychain so `boxme claude` can authenticate without a token in your shell
-    /// environment. Prompts for the token (echo off); pipe it in to script setup.
-    Login,
-
-    /// Remove the stored Claude token from your keychain.
-    Logout,
 
     /// Copy the changeset staged by a `boxme --json <command>` run into the
     /// project, then remove it from `.boxme/pending`. The explicit second step
@@ -189,10 +81,10 @@ pub enum Command {
     /// repos through boxme — "update all repos in ~/Code for me".
     Skills,
 
-    /// Add host(s) to the package-run allowlist (`.boxme/allow`) without the
-    /// review TUI — the non-interactive counterpart of trusting a host in the
-    /// review. A bare host matches the domain and all subdomains; prefix with
-    /// `=` for that exact host only.
+    /// Add host(s) to the allowlist (`.boxme/allow`) without the review TUI —
+    /// the non-interactive counterpart of trusting a host in the review. A bare
+    /// host matches the domain and all subdomains; prefix with `=` for that
+    /// exact host only.
     Allow {
         #[arg(required = true, value_name = "HOST")]
         hosts: Vec<String>,

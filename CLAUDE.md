@@ -9,8 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 of on the host, so postinstall scripts and composer plugins can't touch your
 machine. After the command runs it shows a full-screen TUI review of every file
 change and network destination, and only copies the result back into the repo on
-explicit approval. Read `README.md` for the user-facing behavior and `PLAN.md`
-for the original design rationale and decisions.
+explicit approval. Read `README.md` for the user-facing behavior. That is the
+whole product: there is deliberately no dev-server mode, no agent mode and no
+VM-management surface — keep it that way.
 
 ## Commands
 
@@ -24,24 +25,15 @@ cargo fmt                    # format
 
 cargo install --path .      # install the `boxme` binary
 boxme setup                 # install the libkrun runtime + build the boxme-base snapshot once (~10 min); required before any run
-boxme setup --force         # rebuild the snapshot (needed after changing BASE_SETUP or --disk; required to bake in `boxme claude`)
+boxme setup --force         # rebuild the snapshot (needed after changing BASE_SETUP or --disk)
 boxme setup --disk 64       # build the snapshot with a 64 GiB writable overlay (default 32)
 
-boxme claude                # run Claude Code in the sandbox interactively, copy the result into your working tree
-boxme claude 'fix the bug'  # one-shot headless agent run; needs a stored token (boxme login) or an env credential
-boxme login                 # save the `claude setup-token` token to the keychain so `boxme claude` can auth
-boxme logout                # remove the stored token
-
+boxme composer install      # interactive: run in the box, review in the TUI, copy back on approval
 boxme --json composer i     # non-interactive: JSON report on stdout, changeset staged to .boxme/pending (not applied)
 boxme apply                 # copy the staged changeset into the project (second step of the --json flow)
 boxme discard               # drop the staged changeset instead
 boxme allow foo.com         # add allowlist host(s) without the TUI (=exact.host for exact-only)
 boxme skills                # install the bundled fleet-update/fleet-fix Claude Code skills to ~/.claude/skills
-
-boxme ps                    # list boxme's VMs (dev sessions, kept run/claude VMs) with status + age; --json for agents
-boxme attach                # shell into this folder's running VM (dev session or kept run); --vm NAME for any
-boxme exec git diff         # one-off command in a running VM, no TTY: split stdout/stderr, exits with its code
-boxme kill NAME... | --all  # stop + remove kept/stray VMs (only boxme's own names accepted)
 ```
 
 ## Releasing
@@ -69,34 +61,31 @@ workflow can also be run manually (`workflow_dispatch`) with a tag input.
 warnings`, and `cargo test` (one Linux runner) so a broken tree never gets
 tagged. Both workflows `apt-get install cmake pkg-config libdbus-1-dev
 libcap-ng-dev` — the native build deps microsandbox pulls in (aws-lc-sys,
-libdbus-sys, and libcap-ng, which msb_krun links for Linux capability handling).
-msb_krun is otherwise pure Rust, so there is no libkrun system package.
+libdbus-sys via the SDK's `keyring` feature, and libcap-ng, which msb_krun links
+for Linux capability handling). msb_krun is otherwise pure Rust, so there is no
+libkrun system package.
 
 Tests are pure unit tests in `#[cfg(test)] mod tests` blocks (in `netcap.rs`,
 `allowlist.rs`, `manifest.rs`, `outside.rs`, `review.rs`, `report.rs`,
-`copyback.rs`, `skills.rs`, `vms.rs`, `run.rs`, `claude.rs`,
-`composer_auth.rs`, `detect.rs`, `scripts.rs`, `util.rs`). There is no
-integration-test harness — anything touching the sandbox is exercised by running
-`boxme` against a real project. There is no rustfmt/clippy config and no
-toolchain pin; default stable applies.
-
-(The old `time` version ceiling in `Cargo.toml` is gone: rcgen 0.14.8 fixed the
-coherence conflict, so `time` floats freely again.)
+`copyback.rs`, `skills.rs`, `run.rs`, `composer_auth.rs`, `detect.rs`,
+`scripts.rs`, `util.rs`). There is no integration-test harness — anything
+touching the sandbox is exercised by running `boxme` against a real project.
+There is no rustfmt/clippy config and no toolchain pin; default stable applies.
 
 ## Architecture
 
 Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
-`dev::dev`, `vms::{attach,exec,ps,kill}`, `claude::claude`, `auth::login`,
-`auth::logout`, `report::apply`, `report::discard`, `run::allow_hosts`, or
-`run::run`. `cli.rs` uses clap derive; `setup`, `dev`, `attach`, `exec`, `ps`,
-`kill`, `claude`, `login`, `logout`,
-`apply`, `discard` and `allow` are named subcommands, and everything else falls
-into an `#[command(external_subcommand)] Run(Vec<String>)`, which is why
-`boxme composer i` works — global flags (`--strict`, `--learn`, `--keep`,
-`--composer-auth`, `--json`, `--memory`, `--cpus`, `-e`) must come *before* the
-package-manager command (and before `claude`). `run::run` returns an exit code
-(`main` propagates it) so the `--json` report can drive scripts; `vms::exec`
-likewise returns the guest command's exit code.
+`report::apply`, `report::discard`, `skills::install`, `run::allow_hosts`, or
+`run::run`. `cli.rs` uses clap derive; `setup`, `apply`, `discard`, `skills` and
+`allow` are named subcommands, and everything else falls into an
+`#[command(external_subcommand)] Run(Vec<String>)`, which is why `boxme composer
+i` works — global flags (`--strict`, `--learn`, `--composer-auth`, `--json`,
+`--memory`, `--cpus`, `-e`) must come *before* the package-manager command.
+`run::run` returns an exit code that `main` propagates: the `--json` report's
+documented code, or — interactively — the guest command's own exit code on
+approval and `1` (`run::EXIT_ABORTED`) when the user aborts the review, so
+`boxme composer install && php artisan migrate` stops when composer failed in
+the box.
 
 `run.rs` is the orchestrator and the file to read first. It splits the args on
 `++` into a command chain (`split_commands` — each command must start with
@@ -135,49 +124,9 @@ an overlay lower + tag a guest git baseline (`scripts::UNPACK`, no tar copy-in) 
 switch PHP/Node versions → snapshot the file manifest → start tcpdump → run the
 command interactively via `attach_with` (streamed via `stream_shell_stderr`
 under `--json`, keeping stdout clean for the report) → stop capture → diff the
-manifest → scan for out-of-workspace writes → build the review rows.
-
-`claude.rs` is a separate path (`boxme claude [PROMPT]`) that reuses the review
-run's integrity core for an AI agent instead of a package manager. It boots the
-same read-only overlay and runs Claude Code *inside* the box (`scripts::claude_run`),
-interactive when no prompt and headless (`-p`) when given. Permission mode is
-chosen per path: **interactive** uses `--permission-mode auto` (the session is
-attached to the user's TTY, so auto mode's classifier is a safety net they can
-answer, and it needs no root-bypass and shows no warning screen); **headless**
-uses `--dangerously-skip-permissions` (unattended, where auto mode would *abort*
-the session on a classifier block — `IS_SANDBOX=1` lets bypass run as the guest
-root, and the sandbox is already the safety boundary). Before launching, the
-script seeds `/root/.claude.json` (`scripts::CLAUDE_SEED`) to mark onboarding
-complete and `/workspace` trusted — a valid token authenticates but doesn't
-suppress the first-run wizard or the per-project trust dialog on a fresh config.
-It then diffs the manifest exactly like `run_command` — but with **no write-set
-partition**: the whole diff is the agent's changeset. There is no review TUI;
-instead the changeset is staged out (`copyback::stage`) and, after teardown,
-copied out by `claude::deliver`. **The default is an in-place apply** to the
-working tree (`copyback::commit`) — the agent's work shows up as plain
-uncommitted edits the user reviews with `git diff`, no clean repo required (it
-even works in a non-git dir). The branch is a *fallback*, not the default: if any
-changed path is one the user has **also edited locally** (`copyback::collisions`,
-a `git status --porcelain` pathspec query — applying would clobber their work),
-an interactive run asks (`ask_collision`: overwrite / branch / abort) and a
-headless run, which can't prompt, lands the work on a fresh `boxme/claude-<epoch>`
-branch instead. The branch path (`copyback::commit_to_branch`) builds the commit
-in a throwaway git worktree at HEAD, so it never reads or writes the user's
-working tree — their in-progress edits survive verbatim and the branch is a clean
-"HEAD + exactly the agent's diff". Nothing reaches the host until after teardown.
-The credential is resolved in precedence order
-(`resolve_claude_env`): an explicit `-e` flag, then the host shell env, then the
-token saved by `boxme login` (`auth::load`) — so the normal path keeps the token
-out of your shell. There is no in-box browser login (the OAuth authorize endpoints
-aren't reachable under enforcement), so a run with no credential bails *before*
-booting. Network enforcement (only Anthropic's services — `anthropic.com` /
-`claude.com` — reachable over TCP) is the exfil mitigation for putting a credential
-in the box. A live run has confirmed keychain auth + boot + PHP switch; **still
-unvalidated against a live VM:** that `CLAUDE_SEED` fully suppresses the first-run
-wizard (the auto-mode opt-in keys `hasResetAutoModeOptInForDefaultOffer` /
-`autoPermissionsNotificationCount` are best-effort — capture the real values from a
-session if the opt-in still shows), and that interactive `--permission-mode auto` /
-headless bypass behave as intended on the `attach_with` TTY.
+manifest → scan for out-of-workspace writes → build the review rows. Every VM
+is throwaway and removed by `remove_vm` as soon as its result has been staged
+out (or discarded); there is no keep/attach affordance.
 
 The project is **bind-mounted read-only** at `/ws-lower` (`boot`) and overlaid at
 `/workspace` with a guest-local writable upper, so nothing is copied in: reads
@@ -187,7 +136,7 @@ host-side, the guest kernel returns `EROFS`). The upper can't live on the guest
 root — that root is itself an overlayfs, which the kernel refuses as an upperdir
 (`not supported as upperdir`) — so `unpack` puts it on a sparse loop-mounted ext4
 sized to the guest root's free space (disk-backed, no RAM pressure unlike tmpfs).
-Because the host project is now the *live overlay lower*, copy-back is split in
+Because the host project is the *live overlay lower*, copy-back is split in
 two (`copyback::stage` then `copyback::commit`): stage tars the changeset out
 while the VM is alive, the VM is torn down, then commit mutates the host tree —
 never while it's mounted. The whole project (including `.git`, `vendor`,
@@ -196,30 +145,6 @@ never while it's mounted. The whole project (including `.git`, `vendor`,
 bind-mounted read-only at `/ws-lower`, readable regardless of any whiteout.
 Existing `vendor`/`node_modules` stay in place, so incremental commands do
 incremental work (`npm ci` clears `node_modules` itself for a clean install).
-
-`dev.rs` is a separate path (`boxme dev [--port …] [command]`, default command
-`composer run dev`) for running a long-lived dev-server stack *inside* the guest
-instead of on the host — so native binaries never have to leave Linux. It boots a
-writable guest with the requested ports published, copies the project in (lighter
-`DEV_UNPACK`, no git baseline), switches versions, runs `composer install` /
-`npm install` *in the guest* (Linux-native, never retargeted or copied back),
-then runs the command attached while a host-side `notify` watcher does **one-way
-host→guest file sync**: every edit is pushed into the guest's real ext4 via the
-agent fs API (`sb.fs().copy_from_host`/`mkdir`/`remove`/`rename`/`symlink`), which
-fires native guest inotify so Vite/Laravel HMR works. The sync only ever flows
-host→guest — nothing the guest writes is copied back — so the integrity guarantee
-holds without any writable bind mount or `.boxme/write` config. The watcher and
-the attached command run concurrently via `tokio::select!` (both borrow `&sb`);
-when the dev server exits, the sync future is dropped and the VM torn down. The
-`is_excluded` list (node_modules, vendor, .git, storage, bootstrap/cache,
-public/build, public/hot, .boxme) is the sync-side inverse of a writable-path
-config: the guest owns those, so the host never pushes them. Ports are bridged
-guest-side (`scripts::port_bridge`, a tiny Node proxy on the guest's eth0 IP →
-`127.0.0.1`) so servers that bind only loopback — artisan serve, Vite by default —
-are still reachable through microsandbox's host→guest forward, which dials the
-guest IP. **Unvalidated against a live VM:** per-edit sync latency under real
-editing, that agentd writes fire guest inotify, and the port-bridge binding
-assumption; verify these on a real `boxme dev` run.
 
 ### Module responsibilities
 
@@ -256,30 +181,25 @@ assumption; verify these on a real `boxme dev` run.
   small `satisfies` checker handles `^`/`~`/ranges/`||` at X.Y granularity) —
   a project requiring ^8.5 boots 8.5 even when the host runs 8.3.
 - `scripts.rs` — **every shell snippet that runs inside the guest lives here** as
-  a `const` or a `format!`-returning fn. The base-image setup (which now also
-  bakes `@anthropic-ai/claude-code`), the unpack/baseline script, version
-  switching, the `claude_run` launcher (per-path permission mode — auto for
-  interactive, bypass for headless — plus the `CLAUDE_SEED` onboarding/trust
-  pre-seed), the file manifest, the out-of-workspace scan, and the
-  tcpdump start/parse commands are all here. Change guest behavior here, not
-  inline.
+  a `const` or a `format!`-returning fn: the base-image setup, the
+  unpack/baseline script, version switching, the file manifest (which records
+  each symlink's target so a retargeted link diffs as modified), the
+  out-of-workspace scan, the npm host-platform export, and the tcpdump
+  start/parse commands. Change guest behavior here, not inline.
 - `netcap.rs` — tcpdump lifecycle plus a lenient token-scanner that parses
-  `tcpdump -r` text output, joins DNS answers to SYN destinations, and classifies
-  each contact as a known registry vs unexpected. Also holds the built-in domain
-  sets: `STRICT_DOMAINS` (registries) and `CLAUDE_DOMAINS` (Anthropic's services —
-  `anthropic.com` for the API, `claude.com` for the `platform.claude.com` startup
-  check).
-  Network capture runs *inside the guest* because microsandbox 0.5 exposes no
-  host-side per-connection observability.
+  `tcpdump -r` text output, joins DNS answers to SYN destinations (only answers
+  that arrived inbound on the NIC from port 53, so a guest-forged answer can't
+  alias an exfil IP to a registry name), lowercases DNS names, and classifies
+  each contact as a known registry vs unexpected. Also holds `STRICT_DOMAINS`
+  (the registries). Network capture runs *inside the guest* because
+  microsandbox exposes no host-side per-connection observability.
 - `manifest.rs` — computes the expected write-set per command, parses the guest
-  file manifest, and diffs before/after into added/modified/deleted.
+  file manifest, and diffs before/after into added/modified/deleted (files by
+  md5, symlinks by target, dirs by existence).
 - `outside.rs` — parses the scan for anything written outside `/workspace` (a
   supply-chain red flag; reported only, never copied back).
-- `allowlist.rs` — the per-project allowlist files (load/merge/save, entry
-  matching). A `Scope` selects the file: `Scope::Packages` → `.boxme/allow` (the
-  composer/npm surface), `Scope::Claude` → `.boxme/claude-allow` (the agent
-  surface). Kept separate so a package run can't inherit reachability to the
-  agent's hosts and vice versa.
+- `allowlist.rs` — the per-project allowlist `.boxme/allow` (load/merge/save,
+  entry matching). Entries and hosts compare lowercased.
 - `review.rs` — the ratatui TUI (Files / Network / Outside tabs, inline diffs,
   host selection in learn and enforce runs, the allow-and-re-run confirmation).
   Returns a `Decision` (approve / abort / re-run) plus the chosen hosts.
@@ -292,114 +212,44 @@ assumption; verify these on a real `boxme dev` run.
 - `copyback.rs` — applies the changeset in two phases so the host tree is never
   mutated while it's a live overlay lower: `stage` tars the approved paths out of
   the guest into a host-side tarball (VM alive, read-only), then — after teardown
-  — `commit` unpacks them into the project (via the shared `apply_staged`),
-  rejecting absolute/`..` paths and applying deletions only within the project
-  dir. For `boxme claude`, `collisions` reports which changed paths the user has
-  *also* edited locally (a `git status --porcelain -z` pathspec query — empty if
-  clean or non-git), and `commit_to_branch` is the branch *fallback*: it builds
-  the agent's commit inside a throwaway git **worktree** checked out at HEAD (temp
-  dir, removed after), so the user's working tree and index are never touched and
-  the branch is a clean "HEAD + exactly the agent's diff". `unique_branch` bumps a
-  `-N` suffix if the name is taken (no abort on a same-second re-run). Hooks are
-  skipped (`--no-verify`) since the content is sandbox-produced. `Staged::tarball`
-  exposes the staged path so an aborted copy-out points the user at their
-  not-yet-applied changes instead of dropping them. (There is no longer a
-  clean-repo preflight — the default copy-out is in place, branch is the fallback.)
-  `Staged` is serde-serializable: `persist`/`load_staged` park it under
-  `.boxme/pending` so a `--json` run and a later `boxme apply` can be separate
-  processes.
-- `dev.rs` — the `boxme dev` path: boot a writable guest with ports forwarded,
-  copy in (this path still tars in via `tar_directory`, *not* the overlay — it
-  installs deps in-guest and needs a writable tree), install deps in-guest, run
-  the dev stack attached, and one-way
-  host→guest file sync via a `notify` watcher + the agent fs API. Reuses
-  `run.rs`'s `pub(crate)` helpers (`resolve_env`, `ensure_cache_volumes`,
-  `cleanup`, `quote_args`, the policy builders). Never copies back. The dev VM
-  is named deterministically per folder (`dev_vm_name` =
-  `boxme-dev-<slug>-<fnv-of-abs-path>`, *not* the random-nonce `run::vm_name`),
-  which is what lets `vms.rs` discover it with no state file.
-  One dev VM per folder is enforced: `dev` refuses to boot if one is already
-  `Running`. Host ports are preflighted (`resolve_free_ports`) by probing
-  `127.0.0.1` — a busy port bumps to the next free one (guest side untouched), so
-  parallel dev sessions across repos don't collide on 8000/5173.
-- `vms.rs` — the VM lifecycle surface: `boxme ps` / `attach` / `exec` / `kill`.
-  boxme's VMs are recognized purely by name shape (`classify`: `boxme-dev-<slug>-
-  <8 hex>` dev, `boxme-<slug>-<4 hex>` run/claude, `boxme-base-builder` setup),
-  so there is no state file and other tools' sandboxes are never touched —
-  `kill` rejects non-boxme names outright. `attach`/`exec` resolve their target
-  via `--vm NAME` or fall back to the current folder's single running VM (the
-  deterministic dev session plus any run VM carrying the folder's slug;
-  several candidates → error listing them). Both connect as a second client
-  (`SandboxHandle::connect`) and `detach()` after, never owning teardown.
-  `attach` opens a TTY (`attach_with`); `exec` is the scriptable sibling — it
-  runs one command from `/workspace` via `util::stream_shell_split` (guest
-  stdout→stdout, stderr→stderr) and returns the guest exit code, which `main`
-  propagates, so agents can inspect a kept VM (`boxme --json ps`, `boxme exec
-  git diff`). `kill` = `SandboxHandle::stop` (graceful, force-kill fallback)
-  then `remove`; `--all` sweeps every boxme VM. Kept VMs come from `--keep`
-  (`run::cleanup` prints the attach/kill commands) and from `boxme claude`'s
-  copy-out-failure path (`stage_failure_notice` does the same). Pure logic
-  (`classify`, folder matching, target picking, age formatting) is unit-tested.
-- `claude.rs` — the `boxme claude [PROMPT]` path: run Claude Code inside the
-  read-only overlay (interactive under `--permission-mode auto`, headless under
-  bypass), then copy its net changeset back out (`deliver`). Reuses `run.rs`'s
-  `pub(crate)` helpers (`resolve_env`, `ensure_cache_volumes`, `cleanup`,
-  `vm_name`, `claude_policy`, `observe_policy`) and a throwaway VM (`run::vm_name`'s
-  random nonce, like the review run — *not* the deterministic `dev_vm_name`). No
-  review TUI: it diffs the manifest (whole diff, no write-set partition),
-  `copyback::stage`s it, tears the VM down, then `deliver`s. **Default delivery is
-  an in-place `copyback::commit`** (uncommitted edits the user reviews with `git
-  diff`); the `boxme/claude-<epoch>` branch is the fallback `deliver` falls to only
-  when `copyback::collisions` flags a changed path the user has also edited —
-  interactive then prompts (`ask_collision`), headless auto-branches. Auth is
-  resolved by `resolve_claude_env` — `-e` flag, then host shell env, then the
-  `auth`-stored token — and the run bails before booting if none is found.
-  `--learn` observes (open egress) and writes the contacted hosts to
-  `.boxme/claude-allow`; otherwise it always enforces.
+  — `commit` extracts into a scratch dir inside the project and swaps it into
+  place, so a corrupt tarball or full disk fails before anything is removed. It
+  rejects absolute/`..` paths, validates symlink/hardlink *targets* too, and
+  applies deletions only within the project dir. A failed apply names the
+  surviving tarball. `Staged` is serde-serializable: `persist`/`load_staged`
+  park it under `.boxme/pending` so a `--json` run and a later `boxme apply` can
+  be separate processes.
 - `composer_auth.rs` — the `--composer-auth` path: lift the host's global
   composer `auth.json` (`COMPOSER_HOME`/XDG/`~/.composer` precedence) into the
   guest as microsandbox **placeholder secrets**, never the raw values. `build`
-  walks the parsed JSON, swaps every `http-basic` password / `github-oauth` /
-  `gitlab-*` / `bearer` token for a `__BOXME_COMPOSER_SECRET_N__` placeholder, and
-  emits a `SecretEntry` per credential (`allowed_hosts` = `*.host`, github also
-  gets `*.githubusercontent.com`; token sections enable header + query
-  `SecretSubstitution`, http-basic keeps the header-only default (header
-  substitution also covers decoded `Authorization: Basic`); `require_tls_identity`
-  on). `inject` is the shared entry point each path calls under its own gate:
-  it pushes `COMPOSER_AUTH` (the placeholder JSON) and `NODE_EXTRA_CA_CERTS`
-  (= `GUEST_TLS_CA_PATH`, so Node trusts the proxy CA — composer's PHP-curl and
-  git already trust the system store the guest agent updates) onto the env, and
-  returns the secrets. Registering any secret on the builder (`secret_entry`)
-  auto-enables 443 TLS interception with the safe defaults (verify upstream,
-  block QUIC). The guest only ever sees placeholders; the host-side TLS proxy
-  splices the real value into the outgoing request only for a TLS-intercepted
-  connection whose SNI matches the credential's host, and the default
-  `BlockAndLog` violation action blocks any attempt to send a placeholder to a
-  *different* host. So a credential can leave the box only toward the one host it
-  already authenticates. `run.rs` gates on `--composer-auth && tool == composer`;
-  `claude.rs` on `--composer-auth` (and bypasses the Anthropic/Claude domains
-  from interception so the agent's own API traffic is untouched); `dev.rs` on
-  `--composer-auth && has_composer`. The credential never enters the guest, so it
-  is never copied back. Pure `build` logic is unit-tested.
-- `auth.rs` — stores the Claude Code OAuth token (`claude setup-token`) that
-  `boxme claude` injects as `CLAUDE_CODE_OAUTH_TOKEN`, so the credential lives in
-  the macOS Keychain (`security` generic-password, service `boxme-claude-oauth`)
-  or a `0600` file under `~/.config/boxme` on Linux — never in a shell rc. `login`
-  prompts for the token (echo off via `stty`, piped input works for scripting),
-  `logout` removes it, `load` is the read path `resolve_claude_env` falls back to.
-  The token is read only at boot and injected into the *guest* env, never the host
-  shell.
+  walks the parsed JSON, swaps every `http-basic` username *and* password /
+  `github-oauth` / `gitlab-*` / `bearer` token for a `__BOXME_COMPOSER_SECRET_N__`
+  placeholder, and emits a `SecretEntry` per credential (`allowed_hosts` =
+  `*.host`, github also gets `*.githubusercontent.com`; token sections enable
+  header + query `SecretSubstitution`, http-basic keeps the header-only default
+  (header substitution also covers decoded `Authorization: Basic`);
+  `require_tls_identity` on). `inject` pushes `COMPOSER_AUTH` (the placeholder
+  JSON) and `NODE_EXTRA_CA_CERTS` (= `GUEST_TLS_CA_PATH`, so Node trusts the
+  proxy CA — composer's PHP-curl and git already trust the system store the guest
+  agent updates) onto the env, and returns the secrets. Registering any secret on
+  the builder (`secret_entry`) auto-enables 443 TLS interception with the safe
+  defaults (verify upstream, block QUIC). The guest only ever sees placeholders;
+  the host-side TLS proxy splices the real value into the outgoing request only
+  for a TLS-intercepted connection whose SNI matches the credential's host, and
+  the default `BlockAndLog` violation action blocks any attempt to send a
+  placeholder to a *different* host. So a credential can leave the box only
+  toward the one host it already authenticates. `run.rs` gates on
+  `--composer-auth && tool == composer`. Pure `build` logic is unit-tested.
 - `skills.rs` — the `boxme skills` path: installs the bundled Claude Code
-  skills (fleet-update, fleet-fix) into `$CLAUDE_CONFIG_DIR/skills` or
-  `~/.claude/skills`. The SKILL.md files under `.claude/skills/` are the single
-  source of truth, compiled in via `include_str!` — edit them there and the
-  binary picks them up on the next build (a test asserts each frontmatter
-  `name` matches its install dir). A skill dir that is already a symlink (a dev
-  checkout wired up by hand) is left untouched.
-- `util.rs` — `tar_directory` (packs a project tarball for the **`dev`** path
-  only — the review run mounts read-only instead; always skips the top-level
-  `vendor/`/`node_modules/`, which `dev` reinstalls Linux-native in-guest and
-  never copies back), shell quoting/slugify, `shell_capture`,
+  skills (fleet-update, fleet-fix — bulk dependency updates / vulnerability
+  fixes across a folder of repos via the `--json` flow) into
+  `$CLAUDE_CONFIG_DIR/skills` or `~/.claude/skills`. The SKILL.md files under
+  `.claude/skills/` are the single source of truth, compiled in via
+  `include_str!` — edit them there and the binary picks them up on the next
+  build (a test asserts each frontmatter `name` matches its install dir). A
+  skill dir that is already a symlink (a dev checkout wired up by hand) is left
+  untouched.
+- `util.rs` — shell quoting/slugify, `raise_fd_limit`, `shell_capture`,
   `stream_shell_stderr` (streams guest exec output to the host terminal).
 
 ### Network policy & the observe/enforce model
@@ -412,18 +262,12 @@ exfil path tcpdump's SYN capture can't see. The three policies are built in
 `netcap::STRICT_DOMAINS`), and `enforced_policy` (strict + allowlist entries).
 The mere *existence* of `.boxme/allow` flips a normal run from observe to
 enforce; `--strict` ignores the allowlist and permits only registries.
+`--strict --learn` and `--json --learn` are rejected up front
+(`conflicting_flags`).
 
-`boxme claude` adds a fourth policy, `claude_policy` (strict baseline + Anthropic's
-services from `netcap::CLAUDE_DOMAINS` + the `.boxme/claude-allow` entries).
-The agent legitimately runs composer/npm itself, so it keeps the registry
-baseline. Unlike the package path there is no observe-by-default: claude always
-enforces, and `boxme claude --learn` swaps in `observe_policy` to discover hosts;
-`--strict` drops the `claude-allow` extras (API + registries only).
-
-Both `.boxme/allow` and `.boxme/claude-allow` share the format: one host per line,
-a bare entry matches the domain and all subdomains, a `=` prefix matches that
-exact host only, `#` comments and blanks ignored. Commit them to share the
-decision with a team.
+`.boxme/allow` format: one host per line, a bare entry matches the domain and
+all subdomains, a `=` prefix matches that exact host only, `#` comments and
+blanks ignored, case-insensitive. Commit it to share the decision with a team.
 
 ### Security boundaries to preserve when editing
 
@@ -439,10 +283,14 @@ decision with a team.
 - The file manifest is NUL-delimited with the path last, so a guest-controlled
   filename containing tabs/newlines can't forge a review entry.
 - Copy-back treats the tarball as sandbox-controlled: it rejects absolute paths
-  and `..` components and never follows symlinks out of the project dir.
+  and `..` components (for link targets too) and never follows symlinks out of
+  the project dir.
 - The out-of-workspace scan uses `-newercm` (ctime, which the guest can't
   backdate with `touch -t`) against a marker stamped *after* setup but *before*
   the command, so it reports only what the command itself wrote.
+- The DNS join in `netcap` only trusts answers captured inbound on the NIC
+  from port 53, and a tcpdump that died mid-run raises a "treat as suspect"
+  banner instead of a clean-looking contact list.
 - `--composer-auth` must never put a raw credential in the guest. The real token
   only ever lives in the host-side TLS proxy (`SecretEntry.value`); the guest
   receives a placeholder. Keep `require_tls_identity` on and `allowed_hosts`
@@ -458,8 +306,8 @@ decision with a team.
 - Anything interpolated into a guest shell is validated host-side first (e.g. PHP
   versions against `PHP_VERSIONS`) or quoted via `util::shell_quote`.
 - VMs are booted *attached* so a crash SIGTERMs them; teardown goes through
-  `cleanup`/`discard`/`remove_vm` in `run.rs`, which drop the handle before
-  `Sandbox::remove` (remove operates by name). `--keep` detaches instead.
+  `remove_vm` in `run.rs`, which drops the handle before `Sandbox::remove`
+  (remove operates by name).
 - The base snapshot is named `boxme-base` (`setup::BASE_SNAPSHOT`); the
   `boxme-node-versions` volume (Node majors installed by `n`) is ensured before
   boot in `ensure_cache_volumes` and mounted at `/root/.n`. The composer/npm

@@ -11,7 +11,7 @@ use microsandbox_network::policy::{
 use microsandbox_network::secrets::config::SecretEntry;
 use owo_colors::OwoColorize;
 
-use crate::allowlist::{self, Scope};
+use crate::allowlist;
 use crate::cli::Cli;
 use crate::composer_auth;
 use crate::copyback::{self, CopyPlan};
@@ -27,6 +27,12 @@ use crate::util::{project_slug, shell_capture, shell_quote, stream_shell_stderr}
 
 /// Fetching a unified diff per unexpected file is one guest exec each — cap it.
 const MAX_DIFFS: usize = 100;
+
+/// Exit code of an interactive run the user aborted in the review: nothing
+/// landed, so a `boxme … && next-step` pipeline must not continue. Shares the
+/// boxme-error code; a run that was approved exits with the guest command's
+/// own code instead, like the bare command would.
+const EXIT_ABORTED: i32 = 1;
 
 /// Everything one in-guest command run produces that the review and copy-back
 /// need. Built by `run_command`.
@@ -45,15 +51,16 @@ struct CommandRun {
     dir_counts: Vec<(String, u64)>,
 }
 
-/// What an enforced review resolves to: either we're finished (copied back or
-/// aborted), or the user allowed blocked host(s) and wants a clean re-run under
-/// the merged allowlist.
+/// What an enforced review resolves to.
 enum AfterReview {
-    /// Review finished. `Some` carries an approved changeset to apply to the
-    /// project *after* the VM is torn down — the project is the live overlay
-    /// lower during the run, so it must not be mutated until the mount is gone.
-    /// `None` means abort or nothing to copy back.
-    Done(Option<copyback::Staged>),
+    /// Approved: a changeset to apply to the project *after* the VM is torn
+    /// down — the project is the live overlay lower during the run, so it must
+    /// not be mutated until the mount is gone.
+    Approved(copyback::Staged),
+    /// The user quit the review; nothing lands.
+    Aborted,
+    /// The user allowed blocked host(s) and wants a clean re-run under the
+    /// merged allowlist.
     Rerun(Vec<String>),
 }
 
@@ -137,7 +144,7 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
         let allow = if cli.strict {
             Vec::new()
         } else {
-            allowlist::load(&project_dir, Scope::Packages)
+            allowlist::load(&project_dir)
         };
         return json_run(&ctx, allow).await;
     }
@@ -145,24 +152,23 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     // A run learns (observe + pick) when asked to, or the first time a project
     // has no allowlist yet. Otherwise it enforces straight away: `--strict` is
     // registries-only, an existing allowlist is registries + its entries.
-    if cli.learn || (!cli.strict && !allowlist::exists(&project_dir, Scope::Packages)) {
-        learn_run(&ctx).await?;
+    if cli.learn || (!cli.strict && !allowlist::exists(&project_dir)) {
+        learn_run(&ctx).await
     } else {
         // --strict ignores the allowlist (registries only) and disables the
         // allow-and-re-run affordance, since allowlisting wouldn't change it.
         let (allow, can_trust) = if cli.strict {
             (Vec::new(), false)
         } else {
-            (allowlist::load(&project_dir, Scope::Packages), true)
+            (allowlist::load(&project_dir), true)
         };
-        enforced_run(&ctx, allow, can_trust).await?;
+        enforced_run(&ctx, allow, can_trust).await
     }
-    Ok(0)
 }
 
 /// Flag combinations that contradict each other, rejected up front — before
-/// anything boots. Used by the package path and `boxme claude` alike.
-pub(crate) fn conflicting_flags(cli: &Cli) -> Option<&'static str> {
+/// anything boots.
+fn conflicting_flags(cli: &Cli) -> Option<&'static str> {
     if cli.strict && cli.learn {
         return Some(
             "--strict contradicts --learn: learning runs the command with the network \
@@ -230,18 +236,8 @@ async fn json_run(ctx: &RunCtx<'_>, allow: Vec<String>) -> Result<i32> {
         Ok::<_, anyhow::Error>((run, staged))
     }
     .await;
-    let (run, staged) = match outcome {
-        Ok(v) => {
-            cleanup(ctx.cli, sb, &name).await;
-            v
-        }
-        Err(e) => {
-            // Honor --keep here too: a failed run is exactly when a kept VM is
-            // useful for poking around.
-            cleanup(ctx.cli, sb, &name).await;
-            return Err(e);
-        }
-    };
+    remove_vm(sb, &name).await;
+    let (run, staged) = outcome?;
 
     // VM is gone — safe to write into the project tree now.
     let pending = match staged {
@@ -356,20 +352,21 @@ pub(crate) fn allow_hosts(hosts: &[String]) -> Result<()> {
         }
     }
     let project_dir = std::env::current_dir()?;
-    let merged = allowlist::save_merged(&project_dir, Scope::Packages, hosts)?;
+    let merged = allowlist::save_merged(&project_dir, hosts)?;
     eprintln!(
         "{} {} host(s) → {}",
         ">> allowlist:".dimmed(),
         merged.len(),
-        allowlist::path(&project_dir, Scope::Packages).display(),
+        allowlist::path(&project_dir).display(),
     );
     Ok(())
 }
 
 /// Observe the command with the network open, let the user trust hosts in the
 /// review, save them, then either copy back directly (if nothing it touched
-/// would be blocked) or re-run under enforcement for a clean result.
-async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
+/// would be blocked) or re-run under enforcement for a clean result. Returns
+/// the exit code for the process: the guest command's own, or `EXIT_ABORTED`.
+async fn learn_run(ctx: &RunCtx<'_>) -> Result<i32> {
     eprintln!(
         "{}",
         ">> learn: observing this run to build the allowlist".dimmed()
@@ -398,7 +395,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         }
         // Persist the picks; this creates the file even with no extra hosts, so
         // future runs in this project enforce by default.
-        let merged = allowlist::save_merged(ctx.project_dir, Scope::Packages, &outcome.allow)?;
+        let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
         Ok::<_, anyhow::Error>(Some((run, merged)))
     }
     .await;
@@ -406,15 +403,15 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
     let (run, merged) = match staged {
         Ok(Some(staged)) => staged,
         Ok(None) => {
-            discard(sb, &name).await;
+            remove_vm(sb, &name).await;
             eprintln!(
                 "{}",
                 "aborted — no allowlist written, nothing copied back".red()
             );
-            return Ok(());
+            return Ok(EXIT_ABORTED);
         }
         Err(e) => {
-            discard(sb, &name).await;
+            remove_vm(sb, &name).await;
             return Err(e);
         }
     };
@@ -423,7 +420,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         "{} {} extra host(s) → {}",
         ">> learn: allowlist saved,".dimmed(),
         merged.len(),
-        allowlist::path(ctx.project_dir, Scope::Packages).display(),
+        allowlist::path(ctx.project_dir).display(),
     );
 
     // If everything the command contacted is allowed under enforcement, the
@@ -433,10 +430,10 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         // Stage while the VM is alive, then tear it down before mutating the
         // host project (it's the live overlay lower until the VM is gone).
         let staged = stage_copy_back(&sb, ctx.project_dir, ctx.write_set, &run).await;
-        cleanup(ctx.cli, sb, &name).await;
+        remove_vm(sb, &name).await;
         copyback::commit(ctx.project_dir, staged?)?;
         eprintln!("{}", "approved — results copied into the project".green());
-        return Ok(());
+        return Ok(run.exit_code);
     }
 
     eprintln!(
@@ -444,7 +441,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         ">> re-running clean; these contacted host(s) will be blocked:".dimmed(),
         blocked.join(", ").dimmed(),
     );
-    discard(sb, &name).await;
+    remove_vm(sb, &name).await;
     enforced_run(ctx, merged, !ctx.cli.strict).await
 }
 
@@ -452,32 +449,30 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
 /// back on approval or — if the user allowed blocked hosts — re-run clean under
 /// the updated allowlist. `can_trust` is false under `--strict`, where the
 /// allowlist is ignored and allowing a host wouldn't change the next run.
-async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> Result<()> {
+/// Returns the exit code for the process: the guest command's own on approval
+/// (a failed command's partial result can still be applied, but the failure
+/// must not read as success), or `EXIT_ABORTED`.
+async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> Result<i32> {
     let (sb, name) = boot(ctx, enforced_policy(&allow), vm_name(ctx.project_dir)).await?;
     let outcome = async {
         let run = run_command(&sb, ctx).await?;
-        finish_review(&sb, ctx, run, &allow, can_trust).await
+        let exit_code = run.exit_code;
+        let after = finish_review(&sb, ctx, run, &allow, can_trust).await?;
+        Ok::<_, anyhow::Error>((after, exit_code))
     }
     .await;
-
-    // A re-run discards this VM unconditionally — like the observe VM, its result
-    // is thrown away; otherwise tear down honoring --keep.
-    match &outcome {
-        Ok(AfterReview::Rerun(_)) => discard(sb, &name).await,
-        _ => cleanup(ctx.cli, sb, &name).await,
-    }
+    remove_vm(sb, &name).await;
 
     match outcome? {
-        AfterReview::Done(staged) => {
+        (AfterReview::Approved(staged), exit_code) => {
             // VM is down now, so the project is no longer a live overlay lower —
             // safe to mutate the host tree.
-            if let Some(staged) = staged {
-                copyback::commit(ctx.project_dir, staged)?;
-                eprintln!("{}", "approved — results copied into the project".green());
-            }
-            Ok(())
+            copyback::commit(ctx.project_dir, staged)?;
+            eprintln!("{}", "approved — results copied into the project".green());
+            Ok(exit_code)
         }
-        AfterReview::Rerun(merged) => {
+        (AfterReview::Aborted, _) => Ok(EXIT_ABORTED),
+        (AfterReview::Rerun(merged), _) => {
             eprintln!(
                 "{}",
                 ">> re-running clean under the updated allowlist".dimmed()
@@ -697,21 +692,21 @@ async fn finish_review(
     match outcome.decision {
         Decision::Abort => {
             eprintln!("{}", "aborted — nothing copied back".red());
-            Ok(AfterReview::Done(None))
+            Ok(AfterReview::Aborted)
         }
         Decision::Approve => {
             // Pull the changeset out while the VM is alive; the caller applies it
             // to the host once the VM (and its read-only project bind) is gone.
             let staged = stage_copy_back(sb, ctx.project_dir, ctx.write_set, &run).await?;
-            Ok(AfterReview::Done(Some(staged)))
+            Ok(AfterReview::Approved(staged))
         }
         Decision::Rerun => {
-            let merged = allowlist::save_merged(ctx.project_dir, Scope::Packages, &outcome.allow)?;
+            let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
             eprintln!(
                 "{} {} host(s) → {}",
                 ">> allowed".dimmed(),
                 outcome.allow.len(),
-                allowlist::path(ctx.project_dir, Scope::Packages).display(),
+                allowlist::path(ctx.project_dir).display(),
             );
             Ok(AfterReview::Rerun(merged))
         }
@@ -850,7 +845,7 @@ async fn fetch_diff(sb: &Sandbox, path: &str, change: &Change) -> Option<String>
 }
 
 /// The user's command tokens, re-quoted for the guest shell.
-pub(crate) fn quote_args(args: &[String]) -> String {
+fn quote_args(args: &[String]) -> String {
     args.iter()
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
@@ -860,23 +855,41 @@ pub(crate) fn quote_args(args: &[String]) -> String {
 /// A guest-shell `export` that makes a Linux-guest `npm install` resolve the
 /// *host's* platform-gated native deps, so the copied-back `node_modules` has
 /// the macOS prebuilt binaries (esbuild, rollup, lightningcss, swc, sharp, …)
-/// the host will load — empty if no chained command is npm, the host isn't
-/// macOS, or the user already pinned `npm_config_os` via `-e` (their value
-/// wins). Prints a note so the run is honest about retargeting the install.
+/// the host will load — empty if no chained command is npm or the host isn't
+/// macOS. Whichever of `npm_config_os` / `npm_config_cpu` the user pinned via
+/// `-e` is left alone (their value wins). Prints a note so the run is honest
+/// about retargeting the install.
 fn npm_platform_export(uses_npm: bool, env: &[(String, String)]) -> String {
-    if !uses_npm || env.iter().any(|(k, _)| k == "npm_config_os") {
+    if !uses_npm {
         return String::new();
     }
-    match host_npm_target() {
-        Some((os, cpu)) => {
-            eprintln!(
-                "{} resolving {os}/{cpu} native deps for the host",
-                ">> npm:".dimmed()
-            );
-            scripts::npm_platform_env(os, cpu)
-        }
-        None => String::new(),
+    let Some(target) = host_npm_target() else {
+        return String::new();
+    };
+    let (os, cpu) = npm_platform_overrides(target, env);
+    if os.is_none() && cpu.is_none() {
+        return String::new();
     }
+    eprintln!(
+        "{} resolving {}/{} native deps for the host",
+        ">> npm:".dimmed(),
+        os.unwrap_or("(pinned os)"),
+        cpu.unwrap_or("(pinned cpu)"),
+    );
+    scripts::npm_platform_env(os, cpu)
+}
+
+/// Which of the host target's `os`/`cpu` to export: each one only if the user
+/// hasn't already pinned the matching `npm_config_*` variable.
+fn npm_platform_overrides<'a>(
+    (os, cpu): (&'a str, &'a str),
+    env: &[(String, String)],
+) -> (Option<&'a str>, Option<&'a str>) {
+    let pinned = |key: &str| env.iter().any(|(k, _)| k == key);
+    (
+        (!pinned("npm_config_os")).then_some(os),
+        (!pinned("npm_config_cpu")).then_some(cpu),
+    )
 }
 
 /// The host's npm `os`/`cpu` target. `None` on non-macOS hosts — there the guest
@@ -897,7 +910,7 @@ fn host_npm_target() -> Option<(&'static str, &'static str)> {
 /// `-e KEY=VALUE` is taken verbatim; bare `-e KEY` copies the host value and
 /// errors if the host doesn't have it (a silent skip would surface later as a
 /// confusing auth failure in the guest).
-pub(crate) fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
+fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
     specs
         .iter()
         .map(|spec| {
@@ -965,40 +978,21 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
     Ok((sb, name))
 }
 
-/// Tear down the run VM, honoring `--keep`.
-pub(crate) async fn cleanup(cli: &Cli, sb: Sandbox, name: &str) {
-    if cli.keep {
-        eprintln!(
-            "{} VM kept running as '{name}' — `boxme attach --vm {name}` opens a shell, \
-             `boxme kill {name}` removes it",
-            ">> --keep:".dimmed()
-        );
-        sb.detach().await;
-    } else {
-        remove_vm(sb, name, "VM").await;
-    }
-}
-
-/// Unconditionally remove a VM (ignores `--keep`) — used for the throwaway
-/// observe VM once a learn run decides to re-run under enforcement.
-async fn discard(sb: Sandbox, name: &str) {
-    remove_vm(sb, name, "observe VM").await;
-}
-
-/// Stop and remove a VM. `Sandbox::remove` operates by name, so the local
-/// handle is dropped first to release it before removal.
-async fn remove_vm(sb: Sandbox, name: &str, label: &str) {
+/// Stop and remove the run VM. Every run is throwaway: its result has either
+/// been staged out or discarded by the time this is called. `Sandbox::remove`
+/// operates by name, so the local handle is dropped first to release it.
+async fn remove_vm(sb: Sandbox, name: &str) {
     let _ = sb.stop().await;
     drop(sb);
     if let Err(e) = Sandbox::remove(name).await {
-        eprintln!("warning: could not remove {label} '{name}': {e}");
+        eprintln!("warning: could not remove VM '{name}': {e}");
     }
 }
 
 /// Named volumes must exist before a sandbox can mount them. Only the
 /// Node-version volume is mounted now (see `boot`); the composer/npm download
 /// caches stay guest-local to avoid the host's per-process file-descriptor cap.
-pub(crate) async fn ensure_cache_volumes() -> Result<()> {
+async fn ensure_cache_volumes() -> Result<()> {
     let existing = Volume::list().await?;
     let name = "boxme-node-versions";
     if !existing.iter().any(|v| v.name() == name) {
@@ -1007,7 +1001,7 @@ pub(crate) async fn ensure_cache_volumes() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn vm_name(project_dir: &Path) -> String {
+fn vm_name(project_dir: &Path) -> String {
     let slug = project_slug(project_dir);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1023,7 +1017,7 @@ pub(crate) fn vm_name(project_dir: &Path) -> String {
 /// SYN-based capture can't even see. Private/loopback/link-local/metadata stay
 /// denied by falling through to the default, as with microsandbox's own
 /// `public_only` default.
-pub(crate) fn observe_policy() -> NetworkPolicy {
+fn observe_policy() -> NetworkPolicy {
     NetworkPolicy {
         default_egress: Action::Deny,
         default_ingress: Action::Allow,
@@ -1041,7 +1035,7 @@ pub(crate) fn observe_policy() -> NetworkPolicy {
 }
 
 /// Deny-by-default egress: DNS plus the package registries over HTTP(S).
-pub(crate) fn strict_policy() -> NetworkPolicy {
+fn strict_policy() -> NetworkPolicy {
     let mut rules = vec![Rule::allow_dns()];
     for host in netcap::STRICT_DOMAINS {
         rules.push(entry_rule(host).expect("builtin strict domain parses"));
@@ -1055,28 +1049,8 @@ pub(crate) fn strict_policy() -> NetworkPolicy {
 
 /// Strict baseline plus the user's saved allowlist entries. Unparseable entries
 /// are skipped (they can only get there by hand-editing the file).
-pub(crate) fn enforced_policy(extra: &[String]) -> NetworkPolicy {
+fn enforced_policy(extra: &[String]) -> NetworkPolicy {
     let mut policy = strict_policy();
-    for entry in extra {
-        if let Some(rule) = entry_rule(entry) {
-            policy.rules.push(rule);
-        }
-    }
-    policy
-}
-
-/// Deny-by-default egress for `boxme claude`: the strict baseline (DNS + package
-/// registries — the agent legitimately runs composer/npm itself), the Anthropic
-/// API, and the user's `.boxme/claude-allow` extras. Unlike the package path
-/// there is no observe-by-default: claude always enforces, and `--learn` swaps in
-/// `observe_policy` to discover hosts instead.
-pub(crate) fn claude_policy(extra: &[String]) -> NetworkPolicy {
-    let mut policy = strict_policy();
-    for host in netcap::CLAUDE_DOMAINS {
-        policy
-            .rules
-            .push(entry_rule(host).expect("builtin claude domain parses"));
-    }
     for entry in extra {
         if let Some(rule) = entry_rule(entry) {
             policy.rules.push(rule);
@@ -1197,6 +1171,33 @@ mod tests {
         assert_eq!(
             enforced_status(&contact(None, false), &allow, true),
             (NetStatus::Blocked, false)
+        );
+    }
+
+    #[test]
+    fn npm_platform_overrides_skip_whatever_the_user_pinned() {
+        let env = |keys: &[&str]| {
+            keys.iter()
+                .map(|k| (k.to_string(), "x".to_string()))
+                .collect::<Vec<_>>()
+        };
+        let target = ("darwin", "arm64");
+        assert_eq!(
+            npm_platform_overrides(target, &env(&[])),
+            (Some("darwin"), Some("arm64"))
+        );
+        assert_eq!(
+            npm_platform_overrides(target, &env(&["npm_config_os"])),
+            (None, Some("arm64"))
+        );
+        // A lone cpu pin must not be clobbered by boxme's own export.
+        assert_eq!(
+            npm_platform_overrides(target, &env(&["npm_config_cpu"])),
+            (Some("darwin"), None)
+        );
+        assert_eq!(
+            npm_platform_overrides(target, &env(&["npm_config_os", "npm_config_cpu"])),
+            (None, None)
         );
     }
 

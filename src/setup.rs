@@ -10,14 +10,14 @@ use crate::util::stream_shell_stderr;
 
 /// Snapshot every boxme run boots from. Built once, reused for fast boots.
 pub const BASE_SNAPSHOT: &str = "boxme-base";
-pub(crate) const BUILDER: &str = "boxme-base-builder";
+const BUILDER: &str = "boxme-base-builder";
 
 /// A sandbox builder that cold-boots `name` from the base snapshot.
 ///
 /// microsandbox 0.7 moved snapshot boots to `Sandbox::restore`, but that
 /// builder deliberately has no `env`, `secret_entry`, TLS settings, `replace`
-/// or attached mode — all of which every boxme boot needs (credentials and
-/// composer-auth placeholders, crash-SIGTERM). The full creation builder still
+/// or attached mode — all of which every boxme boot needs (env, composer-auth
+/// placeholders, crash-SIGTERM). The full creation builder still
 /// resolves a snapshot source through `override_snapshot` (hidden from the docs;
 /// it's what the `msb` CLI uses for config-file snapshot sources), so boot
 /// through that. `BASE_SNAPSHOT` is a disk snapshot, so this is a fresh boot

@@ -18,8 +18,8 @@
 //! copies a placeholder and tries to send it to a *different* host, microsandbox
 //! blocks the request — the real secret never travels anywhere but the one host
 //! it authenticates. Network reachability is unchanged: a private repo still has
-//! to be in `.boxme/allow` (or `.boxme/claude-allow`) to be contacted at all;
-//! the credential simply rides along automatically once the host is allowed.
+//! to be in `.boxme/allow` to be contacted at all; the credential simply rides
+//! along automatically once the host is allowed.
 
 use std::path::PathBuf;
 
@@ -29,9 +29,9 @@ use owo_colors::OwoColorize;
 
 /// Guest-side path where microsandbox's agent installs the TLS interception CA.
 /// Mirrors `microsandbox_protocol::GUEST_TLS_CA_PATH`. Node ships its own CA
-/// bundle and ignores the system trust store, so npm / Claude Code need this
-/// pointed at the proxy CA via `NODE_EXTRA_CA_CERTS`; composer (PHP-curl) and
-/// git use the system store the agent already updated.
+/// bundle and ignores the system trust store, so npm needs this pointed at the
+/// proxy CA via `NODE_EXTRA_CA_CERTS`; composer (PHP-curl) and git use the
+/// system store the agent already updated.
 pub const GUEST_TLS_CA_PATH: &str = "/.msb/tls/ca.pem";
 
 /// The composer credentials rewritten for placeholder injection.
@@ -48,7 +48,7 @@ pub struct ComposerAuth {
 /// Load the host auth.json and, if it holds credentials, push `COMPOSER_AUTH`
 /// (with placeholders) and `NODE_EXTRA_CA_CERTS` onto `env`, returning the
 /// secret entries to register on the sandbox builder. Prints a one-line note.
-/// Callers gate this on `--composer-auth` (and that composer is in play).
+/// The caller gates this on `--composer-auth` (and that composer is in play).
 pub fn inject(env: &mut Vec<(String, String)>) -> Result<Vec<SecretEntry>> {
     match load()? {
         Some(auth) => {
@@ -59,7 +59,7 @@ pub fn inject(env: &mut Vec<(String, String)>) -> Result<Vec<SecretEntry>> {
             );
             env.push(auth.env);
             // Node ignores the system trust store the guest agent updates, so
-            // point npm / Claude Code at the proxy CA explicitly.
+            // point npm at the proxy CA explicitly.
             env.push((
                 "NODE_EXTRA_CA_CERTS".to_string(),
                 GUEST_TLS_CA_PATH.to_string(),
