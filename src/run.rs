@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use clap::CommandFactory;
 use microsandbox::{NetworkPolicy, Sandbox, Volume};
 use microsandbox_network::policy::{
     Action, Destination, DestinationGroup, Direction, DomainName, PortRange, Protocol, Rule,
@@ -53,6 +54,24 @@ struct CommandRun {
     dir_counts: Vec<(String, u64)>,
     /// Package versions the changed lockfiles moved, across every manager.
     packages: Vec<PackageChange>,
+    /// Whether the command wrote into an expected dir (vendor/, node_modules/),
+    /// which `changes` doesn't cover.
+    wrote_expected_dirs: bool,
+}
+
+impl CommandRun {
+    /// A failed command that left nothing to apply or look into: no file
+    /// changed inside the project or outside it, the scans are complete, and
+    /// every contact is one `allow` lets through. Its review would be empty.
+    fn failed_without_changes(&self, allow: &[String]) -> bool {
+        self.exit_code != 0
+            && self.changes.is_empty()
+            && !self.wrote_expected_dirs
+            && self.outside.available
+            && self.outside.files.is_empty()
+            && self.network_banner.is_none()
+            && blocked_hosts(&self.network, allow).is_empty()
+    }
 }
 
 /// What an enforced review resolves to.
@@ -66,6 +85,17 @@ enum AfterReview {
     /// The user allowed blocked host(s) and wants a clean re-run under the
     /// merged allowlist.
     Rerun(Vec<String>),
+    /// The command failed without changing anything, so no review was shown.
+    FailedWithoutChanges,
+}
+
+/// What a learn run's review resolves to.
+enum Learned {
+    /// Approved under this saved allowlist.
+    Approved(Vec<String>),
+    Aborted,
+    /// The command failed without changing anything, so no review was shown.
+    FailedWithoutChanges,
 }
 
 /// The per-run inputs every stage shares: which command, where, the detected
@@ -90,6 +120,16 @@ struct RunCtx<'a> {
 pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     // 1. Validate + detect.
     let commands = split_commands(args)?;
+    for (tool, flag) in misplaced_flags(&commands) {
+        eprintln!(
+            "{}",
+            format!(
+                "warning: `{flag}` comes after `{tool}`, so {tool} gets it, not boxme — \
+                 boxme's own flags go first: `boxme {flag} {tool} …`"
+            )
+            .yellow()
+        );
+    }
     if let Some(conflict) = conflicting_flags(cli) {
         bail!("{conflict}");
     }
@@ -213,6 +253,31 @@ fn split_commands(args: &[String]) -> Result<Vec<Vec<String>>> {
         }
     }
     Ok(commands)
+}
+
+/// boxme's own flags written after a package-manager command, each with that
+/// command's tool. Everything after `composer`/`npm` goes to the tool
+/// untouched, so `boxme npm install --strict` quietly runs without boxme's
+/// strict policy. Only long flags count: `-a` is also composer's
+/// `--classmap-authoritative`.
+fn misplaced_flags(commands: &[Vec<String>]) -> Vec<(&str, &str)> {
+    let ours: Vec<String> = Cli::command()
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .filter_map(|arg| arg.get_long())
+        .map(|long| format!("--{long}"))
+        .collect();
+    let mut misplaced = Vec::new();
+    for command in commands {
+        for arg in &command[1..] {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            let found = (command[0].as_str(), arg.as_str());
+            if ours.iter().any(|own| own == flag) && !misplaced.contains(&found) {
+                misplaced.push(found);
+            }
+        }
+    }
+    misplaced
 }
 
 /// Whether any command in the chain runs `tool`. Valid only after
@@ -379,10 +444,12 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<i32> {
     let (sb, name) = boot(ctx, observe_policy(), vm_name(ctx.project_dir)).await?;
 
     // Everything that can fail before the teardown decision runs here, so the
-    // observe VM is discarded in exactly one place on the error path. `None`
-    // means the user aborted the review.
-    let staged = async {
+    // observe VM is discarded in exactly one place on the error path.
+    let learned = async {
         let mut run = run_command(&sb, ctx).await?;
+        if run.failed_without_changes(&allowlist::load(ctx.project_dir)) {
+            return Ok((run, Learned::FailedWithoutChanges));
+        }
         let outcome = review::run(Review {
             files: std::mem::take(&mut run.files),
             network: net_rows(&run.network, learn_status),
@@ -396,24 +463,29 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<i32> {
             command: run.command.clone(),
         })?;
         if outcome.decision == Decision::Abort {
-            return Ok(None);
+            return Ok((run, Learned::Aborted));
         }
         // Persist the picks; this creates the file even with no extra hosts, so
         // future runs in this project enforce by default.
         let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
-        Ok::<_, anyhow::Error>(Some((run, merged)))
+        Ok::<_, anyhow::Error>((run, Learned::Approved(merged)))
     }
     .await;
 
-    let (run, merged) = match staged {
-        Ok(Some(staged)) => staged,
-        Ok(None) => {
+    let (run, merged) = match learned {
+        Ok((run, Learned::Approved(merged))) => (run, merged),
+        Ok((_, Learned::Aborted)) => {
             remove_vm(sb, &name).await;
             eprintln!(
                 "{}",
                 "aborted — no allowlist written, nothing copied back".red()
             );
             return Ok(EXIT_ABORTED);
+        }
+        Ok((run, Learned::FailedWithoutChanges)) => {
+            remove_vm(sb, &name).await;
+            report_failure_without_changes(run.exit_code);
+            return Ok(run.exit_code);
         }
         Err(e) => {
             remove_vm(sb, &name).await;
@@ -480,6 +552,10 @@ async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> 
             Ok(exit_code)
         }
         (AfterReview::Aborted, ..) => Ok(EXIT_ABORTED),
+        (AfterReview::FailedWithoutChanges, exit_code, _) => {
+            report_failure_without_changes(exit_code);
+            Ok(exit_code)
+        }
         (AfterReview::Rerun(merged), ..) => {
             eprintln!(
                 "{}",
@@ -622,6 +698,11 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
         }
     }
 
+    let wrote_expected_dirs = !write_set.dirs.is_empty()
+        && shell_capture(sb, &scripts::written_dirs(&write_set.dirs))
+            .await
+            .map_or(true, |out| !out.trim().is_empty());
+
     let mut expected_files: Vec<String> = Vec::new();
     let mut unexpected: Vec<(String, Change)> = Vec::new();
     for (path, change) in &changes {
@@ -676,6 +757,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
         unexpected,
         dir_counts,
         packages,
+        wrote_expected_dirs,
     })
 }
 
@@ -722,6 +804,18 @@ fn lockfile_packages(changes: &[PackageChange], path: &str) -> Vec<PackageChange
         .collect()
 }
 
+/// Stands in for the review a failed, change-free run skips, so the command's
+/// own error stays on screen.
+fn report_failure_without_changes(exit_code: i32) {
+    eprintln!(
+        "{}",
+        format!(
+            "the command failed (exit {exit_code}) without changing anything — nothing to review"
+        )
+        .red()
+    );
+}
+
 /// One line per package manager after an approved run, so the terminal keeps a
 /// record of what the update did once the review is gone.
 fn print_package_summary(changes: &[PackageChange]) {
@@ -739,7 +833,8 @@ fn print_package_summary(changes: &[PackageChange]) {
 
 /// Review of a finished enforced run. Copies back on approval, aborts on quit,
 /// or — when the user marked blocked hosts and confirmed — saves them to the
-/// allowlist and signals a clean re-run.
+/// allowlist and signals a clean re-run. A failed command that changed nothing
+/// skips the review.
 async fn finish_review(
     sb: &Sandbox,
     ctx: &RunCtx<'_>,
@@ -747,6 +842,9 @@ async fn finish_review(
     allow: &[String],
     can_trust: bool,
 ) -> Result<AfterReview> {
+    if run.failed_without_changes(allow) {
+        return Ok(AfterReview::FailedWithoutChanges);
+    }
     let outcome = review::run(Review {
         files: std::mem::take(&mut run.files),
         network: net_rows(&run.network, |c| enforced_status(c, allow, can_trust)),
@@ -1296,5 +1394,112 @@ mod tests {
         // Plain values still pass, including '=' inside the value.
         let ok = resolve_env(&["KEY=a=b".to_string()]).unwrap();
         assert_eq!(ok, vec![("KEY".to_string(), "a=b".to_string())]);
+    }
+
+    #[test]
+    fn boxme_flags_after_the_command_are_flagged() {
+        let commands = |tokens: &[&str]| {
+            split_commands(&tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+
+        assert_eq!(
+            misplaced_flags(&commands(&[
+                "npm",
+                "install",
+                "--strict",
+                "--memory=4096",
+                "--strict",
+                "++",
+                "composer",
+                "update",
+                "--json",
+            ])),
+            vec![
+                ("npm", "--strict"),
+                ("npm", "--memory=4096"),
+                ("composer", "--json")
+            ]
+        );
+        assert!(misplaced_flags(&commands(&[
+            "composer",
+            "install",
+            "-a",
+            "--no-dev",
+            "--help",
+            "--version",
+        ]))
+        .is_empty());
+    }
+
+    #[test]
+    fn only_a_failed_run_that_changed_nothing_skips_its_review() {
+        let contact = |domain: &str, known: bool| NetworkContact {
+            domain: Some(domain.to_string()),
+            ip: "203.0.113.7".to_string(),
+            port: 443,
+            known,
+        };
+        let failed = || CommandRun {
+            command: "boxme composer require nope/nope".to_string(),
+            exit_code: 2,
+            files: Vec::new(),
+            network: vec![contact("repo.packagist.org", true)],
+            network_banner: None,
+            outside: OutsideScan {
+                files: Vec::new(),
+                available: true,
+                truncated: false,
+            },
+            changes: Vec::new(),
+            expected_files: Vec::new(),
+            unexpected: Vec::new(),
+            dir_counts: Vec::new(),
+            packages: Vec::new(),
+            wrote_expected_dirs: false,
+        };
+        let allow = ["example.com".to_string()];
+
+        assert!(failed().failed_without_changes(&allow));
+        assert!(CommandRun {
+            network: vec![contact("api.example.com", false)],
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+
+        assert!(!CommandRun {
+            exit_code: 0,
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            changes: vec![("composer.json".to_string(), Change::Modified)],
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            wrote_expected_dirs: true,
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            network: vec![contact("evil.test", false)],
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            network_banner: Some("capture died".to_string()),
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            outside: OutsideScan::unavailable(),
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            outside: outside::parse("12\tf\t/usr/local/bin/backdoor\n"),
+            ..failed()
+        }
+        .failed_without_changes(&allow));
     }
 }

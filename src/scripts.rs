@@ -1,5 +1,7 @@
 //! All shell run inside the guest, in one place.
 
+use crate::util::shell_quote;
+
 /// Versions of PHP installed side by side in the base snapshot. Keep in sync
 /// with the loop in `BASE_SETUP`.
 pub const PHP_VERSIONS: &[&str] = &["8.3", "8.4", "8.5"];
@@ -219,6 +221,19 @@ exit 0
 /// Count files inside an expected dir (for the "vendor/: 4321 files" summary).
 pub fn count_files(dir: &str) -> String {
     format!("find /workspace/{dir} -type f 2>/dev/null | wc -l")
+}
+
+/// Print each of the expected dirs the command wrote into. The overlay upper
+/// holds an entry for a dir once anything beneath it is added, changed or
+/// deleted, and the file manifest skips these dirs, so this is how a failed
+/// run's partial `vendor/` is noticed. Fails if the upper is missing, so a
+/// broken check never reads as "nothing written".
+pub fn written_dirs(dirs: &[&str]) -> String {
+    let quoted: Vec<String> = dirs.iter().map(|dir| shell_quote(dir)).collect();
+    format!(
+        "cd /boxme-upper/upper || exit 1; ls -d -- {} 2>/dev/null; exit 0",
+        quoted.join(" ")
+    )
 }
 
 /// Marker whose mtime is the cutoff for the out-of-workspace change scan.

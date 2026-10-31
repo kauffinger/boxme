@@ -57,7 +57,8 @@ brings the runtime up to the new boxme's version without rebuilding the snapshot
 ## Usage
 
 Global flags go **before** the command; everything after `composer`/`npm` is
-passed through verbatim.
+passed through verbatim. boxme warns when one of its own flags lands after the
+command — `boxme npm i --strict` hands `--strict` to npm and runs unstrict.
 
 ```sh
 boxme composer require foo/bar
@@ -202,6 +203,9 @@ a reflexive press can't abort a run.
   is that fresh, `composer update` can't resolve at all;
   `boxme composer update --no-security-blocking` updates everything else in
   the meantime.
-- A nonzero exit from the command still shows the review (red banner).
+- A failed command still opens the review (red banner) when it left something
+  to look at: changed files, a partial `vendor/`, writes outside the workspace,
+  a blocked host. If it changed nothing, boxme skips the review, leaves the
+  error on screen and exits with the command's code.
 - `BOXME_DEBUG_NET=/path/file.txt` dumps the raw in-guest `tcpdump -r` text
   behind the Network tab.

@@ -81,11 +81,19 @@ Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
 `#[command(external_subcommand)] Run(Vec<String>)`, which is why `boxme composer
 i` works — global flags (`--strict`, `--learn`, `--composer-auth`, `--json`,
 `--memory`, `--cpus`, `-e`) must come *before* the package-manager command.
+Everything after `composer`/`npm` goes to the tool untouched (users need to pass
+tool flags); `run::misplaced_flags` only warns when one of boxme's long flags
+lands there, since `boxme npm i --strict` would otherwise quietly run unstrict.
 `run::run` returns an exit code that `main` propagates: the `--json` report's
 documented code, or — interactively — the guest command's own exit code on
 approval and `1` (`run::EXIT_ABORTED`) when the user aborts the review, so
 `boxme composer install && php artisan migrate` stops when composer failed in
-the box.
+the box. A failed command that left nothing behind
+(`CommandRun::failed_without_changes`: no changed file, no write into
+`vendor/`/`node_modules/` — the manifest skips those, so `scripts::written_dirs`
+checks the overlay upper — nothing outside the workspace, complete scans, no
+contact the policy blocked) skips the review and exits with its own code, so
+the command's error stays on screen instead of behind an empty review.
 
 `run.rs` is the orchestrator and the file to read first. It splits the args on
 `++` into a command chain (`split_commands` — each command must start with
