@@ -35,6 +35,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Guest PHP version (8.3, 8.4 or 8.5) instead of the detected one. Pass
+    /// the version the app is deployed on, so composer resolves updates for it
+    /// rather than for whatever PHP this machine runs.
+    #[arg(long, global = true, value_name = "X.Y")]
+    pub php: Option<String>,
+
     /// Guest memory in MiB.
     #[arg(long, global = true, default_value_t = 2048)]
     pub memory: u32,
@@ -70,7 +76,13 @@ pub enum Command {
     /// Copy the changeset staged by a `boxme --json <command>` run into the
     /// project, then remove it from `.boxme/pending`. The explicit second step
     /// of the non-interactive flow.
-    Apply,
+    Apply {
+        /// Apply only these paths and whatever lies beneath them, e.g.
+        /// `boxme apply composer.lock public`. The rest of the changeset is
+        /// dropped. Without paths, everything is applied.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+    },
 
     /// Drop the changeset staged by a `boxme --json <command>` run without
     /// applying it.

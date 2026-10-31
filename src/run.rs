@@ -133,6 +133,14 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     if let Some(conflict) = conflicting_flags(cli) {
         bail!("{conflict}");
     }
+    if let Some(php) = &cli.php {
+        if !scripts::PHP_VERSIONS.contains(&php.as_str()) {
+            bail!(
+                "--php {php} isn't in the base image — pick one of {}",
+                scripts::PHP_VERSIONS.join(", ")
+            );
+        }
+    }
     // The review TUI and the attached command both need a terminal — without
     // one, point at the non-interactive flow instead of hanging or garbling.
     if !cli.json && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
@@ -150,11 +158,15 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     }
 
     let project_dir = std::env::current_dir()?;
-    let php = detect::php_version(&project_dir).await;
+    let php = match &cli.php {
+        Some(php) => php.clone(),
+        None => detect::php_version(&project_dir).await,
+    };
     let node = detect::node_major(&project_dir).await;
     eprintln!(
-        "{} php {php}, node {}",
+        "{} php {php}{}, node {}",
         ">> detected:".dimmed(),
+        if cli.php.is_some() { " (--php)" } else { "" },
         node.map(|n| n.to_string())
             .unwrap_or_else(|| format!("{} (default)", scripts::BASE_NODE_MAJOR)),
     );
@@ -508,7 +520,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<i32> {
         // host project (it's the live overlay lower until the VM is gone).
         let staged = stage_copy_back(&sb, ctx.project_dir, ctx.write_set, &run).await;
         remove_vm(sb, &name).await;
-        copyback::commit(ctx.project_dir, staged?)?;
+        copyback::commit(ctx.project_dir, staged?, &copyback::Selection::everything())?;
         eprintln!("{}", "approved — results copied into the project".green());
         print_package_summary(&run.packages);
         return Ok(run.exit_code);
@@ -546,7 +558,7 @@ async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> 
         (AfterReview::Approved(staged), exit_code, changed_packages) => {
             // VM is down now, so the project is no longer a live overlay lower —
             // safe to mutate the host tree.
-            copyback::commit(ctx.project_dir, staged)?;
+            copyback::commit(ctx.project_dir, staged, &copyback::Selection::everything())?;
             eprintln!("{}", "approved — results copied into the project".green());
             print_package_summary(&changed_packages);
             Ok(exit_code)

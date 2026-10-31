@@ -29,7 +29,7 @@ async fn main() {
     // everything else is success/failure.
     let result = match &parsed.command {
         cli::Command::Setup { force, disk } => setup::setup(*force, *disk).await.map(|()| 0),
-        cli::Command::Apply => report::apply(parsed.json).map(|()| 0),
+        cli::Command::Apply { paths } => report::apply(paths, parsed.json).map(|()| 0),
         cli::Command::Discard => report::discard(parsed.json).map(|()| 0),
         cli::Command::Skills => skills::install().map(|()| 0),
         cli::Command::Allow { hosts } => run::allow_hosts(hosts).map(|()| 0),

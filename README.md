@@ -66,6 +66,7 @@ boxme npm ci
 boxme --strict composer install     # registries only, allowlist ignored
 boxme --learn composer install      # re-open the host picker
 boxme --memory 4096 --cpus 4 composer update
+boxme --php 8.3 composer update     # resolve for the PHP the app is deployed on
 boxme -e NPM_TOKEN=xyz npm install  # env into the guest — visible to package code
 boxme -a composer install           # --composer-auth: credentials the guest can't read
 boxme composer install ++ composer run-script post-update-cmd
@@ -105,6 +106,7 @@ flow — same guarantee, nothing lands without explicit approval:
 ```sh
 boxme --json composer install   # run + JSON report on stdout; changeset staged, NOT applied
 boxme apply                     # copy the staged changeset into the project
+boxme apply composer.lock public  # or only these paths; the rest is dropped
 boxme discard                   # or drop it
 boxme allow some-host.com       # trust a blocked host without the TUI, then re-run
 ```
@@ -183,9 +185,11 @@ a reflexive press can't abort a run.
 
 ## Version matching
 
-- **PHP**: `php -v` from the project dir (mise/asdf/Herd shims resolve
-  per-directory), then `composer.json` `require.php`, then 8.4. The image
-  ships 8.3, 8.4 and 8.5.
+- **PHP**: `--php X.Y` if given, else `php -v` from the project dir
+  (mise/asdf/Herd shims resolve per-directory), then `composer.json`
+  `require.php`, then 8.4. The image ships 8.3, 8.4 and 8.5. Composer resolves
+  updates for the guest's PHP, so pass `--php` with the deploy target when this
+  machine runs a different one.
 - **Node**: `node -v` from the project dir, then `.nvmrc`, then
   `engines.node`. Majors other than 24 install via `n` on first use, cached on
   a named volume.

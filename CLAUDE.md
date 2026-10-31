@@ -31,6 +31,7 @@ boxme setup --disk 64       # build the snapshot with a 64 GiB writable overlay 
 boxme composer install      # interactive: run in the box, review in the TUI, copy back on approval
 boxme --json composer i     # non-interactive: JSON report on stdout, changeset staged to .boxme/pending (not applied)
 boxme apply                 # copy the staged changeset into the project (second step of the --json flow)
+boxme apply composer.lock public  # apply only these paths (and what lies beneath them); the rest is dropped
 boxme discard               # drop the staged changeset instead
 boxme allow foo.com         # add allowlist host(s) without the TUI (=exact.host for exact-only)
 boxme skills                # install the bundled fleet-update/fleet-fix Claude Code skills to ~/.claude/skills
@@ -79,7 +80,7 @@ Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
 `run::run`. `cli.rs` uses clap derive; `setup`, `apply`, `discard`, `skills` and
 `allow` are named subcommands, and everything else falls into an
 `#[command(external_subcommand)] Run(Vec<String>)`, which is why `boxme composer
-i` works — global flags (`--strict`, `--learn`, `--composer-auth`, `--json`,
+i` works — global flags (`--strict`, `--learn`, `--composer-auth`, `--json`, `--php`,
 `--memory`, `--cpus`, `-e`) must come *before* the package-manager command.
 Everything after `composer`/`npm` goes to the tool untouched (users need to pass
 tool flags); `run::misplaced_flags` only warns when one of boxme's long flags
@@ -122,7 +123,9 @@ paths fail fast with a pointer to `--json` when stdin/stdout isn't a terminal):
   tears the VM down, and prints a JSON `report::Report` to stdout — file diffs
   partitioned expected/unexpected, network contacts classified, outside writes,
   guest exit code. **Nothing is applied**: the explicit second step is
-  `boxme apply` (`copyback::load_staged` + `commit`) or `boxme discard`. Exit
+  `boxme apply` (`copyback::load_staged` + `commit`) or `boxme discard`.
+  `boxme apply <path>…` takes only those paths (`copyback::Selection`) and
+  refuses a selection that matches nothing staged, keeping the changeset. Exit
   codes: 0 clean, 1 boxme error, 2 command failed (nothing staged), 3 findings
   (`blocked_hosts`, `unexpected_files`, `outside_writes`, plus
   `command_failed` / `*_unavailable`) — derived in `Report::finalize`.
@@ -187,7 +190,8 @@ incremental work (`npm ci` clears `node_modules` itself for a clean install).
   rejected), so `setup --force` removes every old `boxme-base` once the new
   builder is ready, then captures into the `boxme` group. Re-check both on
   each microsandbox bump.
-- `detect.rs` — resolves guest PHP `X.Y` and Node major: host binary run from the
+- `detect.rs` — resolves guest PHP `X.Y` and Node major (`--php` skips the PHP
+  detection; `run` validates it against `scripts::PHP_VERSIONS`): host binary run from the
   project dir first (so mise/asdf/herd shims resolve per-directory), then
   manifest constraints (`composer.json` require.php, `.nvmrc`, `engines.node`),
   then defaults. PHP is clamped to the 8.3–8.5 baked into the image. The host
@@ -247,7 +251,9 @@ incremental work (`npm ci` clears `node_modules` itself for a clean install).
   applies deletions only within the project dir. A failed apply names the
   surviving tarball. `Staged` is serde-serializable: `persist`/`load_staged`
   park it under `.boxme/pending` so a `--json` run and a later `boxme apply` can
-  be separate processes.
+  be separate processes. A `Selection` limits a commit to some paths: only
+  matching tarball entries are extracted, and only matching replace-dirs and
+  deletions are applied (selection paths pass the same containment check).
 - `composer_auth.rs` — the `--composer-auth` path: lift the host's global
   composer `auth.json` (`COMPOSER_HOME`/XDG/`~/.composer` precedence) into the
   guest as microsandbox **placeholder secrets**, never the raw values. `build`

@@ -32,6 +32,48 @@ pub struct Staged {
     deletions: Vec<String>,
 }
 
+/// Which staged paths an apply takes: everything, or only the given
+/// project-relative paths and whatever lies beneath them.
+pub struct Selection {
+    paths: Vec<String>,
+}
+
+impl Selection {
+    pub fn everything() -> Self {
+        Selection { paths: Vec::new() }
+    }
+
+    /// No paths selects everything. Each path is checked like a tarball entry,
+    /// so a selection can't name anything outside the project.
+    pub fn new(paths: &[String]) -> Result<Self> {
+        let mut normalized = Vec::new();
+        for original in paths {
+            let path = original.trim_start_matches("./").trim_end_matches('/');
+            if path.is_empty() || path == "." {
+                bail!("`{original}` selects the whole project — run `boxme apply` without paths");
+            }
+            safe_join(Path::new(""), path)?;
+            normalized.push(path.to_string());
+        }
+        Ok(Selection { paths: normalized })
+    }
+
+    pub fn is_everything(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn includes(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        self.is_everything()
+            || self.paths.iter().any(|selected| {
+                path == selected
+                    || path
+                        .strip_prefix(selected.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+}
+
 /// Tar the approved paths out of the guest into a host-side tarball. Only reads
 /// the guest `/workspace`; performs no host mutation, so it is safe to run while
 /// the VM still has the project bind-mounted read-only.
@@ -117,6 +159,22 @@ pub fn load_staged(dir: &Path) -> Result<Staged> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {} failed", path.display()))
 }
 
+impl Staged {
+    /// Every path the changeset would write or delete.
+    pub fn paths(&self) -> Result<Vec<String>> {
+        let mut paths = self.deletions.clone();
+        if let Some(tgz) = &self.tgz {
+            let file = std::fs::File::open(tgz)
+                .with_context(|| format!("opening {} failed", tgz.display()))?;
+            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+            for entry in archive.entries()? {
+                paths.push(entry?.path()?.to_string_lossy().into_owned());
+            }
+        }
+        Ok(paths)
+    }
+}
+
 /// Rename, falling back to copy+remove for a cross-filesystem move (the staged
 /// tarball starts life in the system temp dir).
 fn move_file(from: &Path, to: &Path) -> Result<()> {
@@ -136,14 +194,14 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
 /// the operations least likely to fail part-way. Does *not* remove the source
 /// tarball — the caller drops it only once the whole operation has succeeded.
 /// Every target is confined to `base` (tarball content is sandbox-controlled).
-fn apply_staged(base: &Path, staged: &Staged) -> Result<()> {
+fn apply_staged(base: &Path, staged: &Staged, selection: &Selection) -> Result<()> {
     if let Some(host_tgz) = &staged.tgz {
         let scratch = base.join(format!(".boxme-apply-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch)
             .with_context(|| format!("creating {} failed", scratch.display()))?;
-        let swapped = extract(host_tgz, &scratch).and_then(|()| {
-            for dir in &staged.replace_dirs {
+        let swapped = extract(host_tgz, &scratch, selection).and_then(|()| {
+            for dir in staged.replace_dirs.iter().filter(|d| selection.includes(d)) {
                 if let Some(target) = contained_target(base, dir)? {
                     remove_contained(&target)?;
                 }
@@ -153,7 +211,7 @@ fn apply_staged(base: &Path, staged: &Staged) -> Result<()> {
         let _ = std::fs::remove_dir_all(&scratch);
         swapped?;
     }
-    for path in &staged.deletions {
+    for path in staged.deletions.iter().filter(|p| selection.includes(p)) {
         if let Some(target) = contained_target(base, path)? {
             remove_contained(&target)?;
         }
@@ -199,17 +257,18 @@ fn recovery_context(err: anyhow::Error, staged: &Staged) -> anyhow::Error {
     }
 }
 
-/// Apply a staged changeset to the project in place: replace the expected dirs
-/// wholesale, unpack the tarball, then apply deletions. Run only after the VM is
-/// gone, so the host tree is no longer a live overlay lower. All target paths are
-/// confined to the project dir (tarball content is sandbox-controlled).
-pub fn commit(project_dir: &Path, staged: Staged) -> Result<()> {
+/// Apply the selected part of a staged changeset to the project in place:
+/// replace the expected dirs wholesale, unpack the tarball, then apply
+/// deletions. Run only after the VM is gone, so the host tree is no longer a
+/// live overlay lower. All target paths are confined to the project dir
+/// (tarball content is sandbox-controlled).
+pub fn commit(project_dir: &Path, staged: Staged, selection: &Selection) -> Result<()> {
     // Resolve the project dir once so containment checks compare canonical
     // paths. Every destructive target is confined to this.
     let base = project_dir
         .canonicalize()
         .with_context(|| format!("canonicalizing {} failed", project_dir.display()))?;
-    apply_staged(&base, &staged).map_err(|e| recovery_context(e, &staged))?;
+    apply_staged(&base, &staged, selection).map_err(|e| recovery_context(e, &staged))?;
     if let Some(host_tgz) = &staged.tgz {
         let _ = std::fs::remove_file(host_tgz);
     }
@@ -258,7 +317,7 @@ fn contained_target(base: &Path, rel: &str) -> Result<Option<PathBuf>> {
 /// of `unpack_in`'s own containment. Link entries are guest-authored too: their
 /// *target* is validated as well, so copy-back can't plant a symlink pointing
 /// outside the project dir (e.g. `innocuous.txt -> /Users/you/.ssh/id_rsa`).
-fn extract(tgz: &Path, dest: &Path) -> Result<()> {
+fn extract(tgz: &Path, dest: &Path, selection: &Selection) -> Result<()> {
     let file = std::fs::File::open(tgz)?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
@@ -292,7 +351,9 @@ fn extract(tgz: &Path, dest: &Path) -> Result<()> {
                 );
             }
         }
-        entry.unpack_in(dest)?;
+        if selection.includes(&path.to_string_lossy()) {
+            entry.unpack_in(dest)?;
+        }
     }
     Ok(())
 }
@@ -429,7 +490,7 @@ mod tests {
             replace_dirs: vec!["vendor".to_string()],
             deletions: vec!["old.txt".to_string()],
         };
-        commit(&project, staged).unwrap();
+        commit(&project, staged, &Selection::everything()).unwrap();
 
         assert!(
             !project.join("vendor/stale.txt").exists(),
@@ -467,6 +528,77 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_applies_only_the_named_paths() {
+        let dir = std::env::temp_dir().join(format!("boxme-select-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = seeded_project(
+            &dir,
+            &[
+                ("vendor/stale.txt", "stale"),
+                ("CLAUDE.md", "mine"),
+                ("old.txt", "keep me"),
+                ("public/build/old.js", "delete me"),
+            ],
+        );
+        let tgz = file_tarball(
+            &dir,
+            &[
+                ("vendor/new.txt", "new"),
+                ("composer.lock", "lock"),
+                ("CLAUDE.md", "boost rewrote this"),
+                ("public/build/app.js", "built"),
+            ],
+        );
+        let staged = Staged {
+            tgz: Some(tgz),
+            replace_dirs: vec!["vendor".to_string()],
+            deletions: vec!["old.txt".to_string(), "public/build/old.js".to_string()],
+        };
+        let selection =
+            Selection::new(&["./composer.lock".to_string(), "public/".to_string()]).unwrap();
+
+        assert_eq!(
+            staged
+                .paths()
+                .unwrap()
+                .into_iter()
+                .filter(|p| selection.includes(p))
+                .collect::<Vec<_>>(),
+            vec![
+                "public/build/old.js",
+                "composer.lock",
+                "public/build/app.js"
+            ]
+        );
+        commit(&project, staged, &selection).unwrap();
+
+        let read = |path: &str| std::fs::read_to_string(project.join(path)).unwrap();
+        assert_eq!(read("composer.lock"), "lock");
+        assert_eq!(read("public/build/app.js"), "built");
+        assert!(!project.join("public/build/old.js").exists());
+        assert_eq!(read("CLAUDE.md"), "mine");
+        assert_eq!(read("old.txt"), "keep me");
+        assert_eq!(read("vendor/stale.txt"), "stale", "vendor/ wasn't selected");
+        assert!(!project.join("vendor/new.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_selection_matches_whole_path_components_and_stays_in_the_project() {
+        let selection = Selection::new(&["public".to_string()]).unwrap();
+        assert!(selection.includes("public"));
+        assert!(selection.includes("public/build/"));
+        assert!(!selection.includes("public-assets/app.js"));
+        assert!(Selection::everything().includes("anything/at/all"));
+
+        assert!(Selection::new(&["../outside".to_string()]).is_err());
+        assert!(Selection::new(&["/etc/passwd".to_string()]).is_err());
+        assert!(Selection::new(&["./".to_string()]).is_err());
+    }
+
+    #[test]
     fn failed_commit_leaves_the_project_untouched_and_points_at_the_tarball() {
         let dir =
             std::env::temp_dir().join(format!("boxme-commit-fail-test-{}", std::process::id()));
@@ -481,7 +613,7 @@ mod tests {
             replace_dirs: vec!["vendor".to_string()],
             deletions: Vec::new(),
         };
-        let err = commit(&project, staged).unwrap_err();
+        let err = commit(&project, staged, &Selection::everything()).unwrap_err();
 
         assert!(
             project.join("vendor/stale.txt").exists(),
@@ -528,7 +660,7 @@ mod tests {
         let tgz = link_tarball(&dir, links);
         let dest = dir.join("project");
         std::fs::create_dir_all(&dest).unwrap();
-        extract(&tgz, &dest).map(|()| dest)
+        extract(&tgz, &dest, &Selection::everything()).map(|()| dest)
     }
 
     #[test]
