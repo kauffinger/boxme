@@ -82,7 +82,7 @@ Entry point `main.rs` parses the CLI and dispatches to `setup::setup`,
 `#[command(external_subcommand)] Run(Vec<String>)`, which is why `boxme composer
 i` works — global flags (`--strict`, `--learn`, `--composer-auth`, `--json`, `--php`,
 `--memory`, `--cpus`, `-e`) must come *before* the package-manager command.
-Everything after `composer`/`npm` goes to the tool untouched (users need to pass
+Everything after `composer`/`npm`/`php` goes to the tool untouched (users need to pass
 tool flags); `run::misplaced_flags` only warns when one of boxme's long flags
 lands there, since `boxme npm i --strict` would otherwise quietly run unstrict.
 `run::run` returns an exit code that `main` propagates: the `--json` report's
@@ -98,9 +98,10 @@ the command's error stays on screen instead of behind an empty review.
 
 `run.rs` is the orchestrator and the file to read first. It splits the args on
 `++` into a command chain (`split_commands` — each command must start with
-`composer`/`npm`; the chain runs sequentially in one guest via `&&` and
+`composer`, `npm` or `php`; the chain runs sequentially in one guest via `&&` and
 produces one combined changeset, with `manifest::expected_write_set_all` as the
-union write-set), detects versions, then chooses one of three paths (the TUI
+union write-set — `php` commands, for running an app's tests on what an install
+put in place, expect no writes at all), detects versions, then chooses one of three paths (the TUI
 paths fail fast with a pointer to `--json` when stdin/stdout isn't a terminal):
 
 - **`enforced_run`** — deny-by-default pass: boot under the allowlist, run,

@@ -102,11 +102,12 @@ pub enum Command {
         hosts: Vec<String>,
     },
 
-    /// Anything else is the package-manager command to run, e.g. `boxme composer i`.
-    /// Chain commands with `++` to run them sequentially in one sandbox and
-    /// review one combined changeset, e.g.
+    /// Anything else is the command to run: composer, npm or php, e.g.
+    /// `boxme composer i`. Chain commands with `++` to run them sequentially in
+    /// one sandbox and review one combined changeset, e.g.
     /// `boxme --json composer install ++ composer run-script post-update-cmd` —
-    /// the script hook sees `vendor/` without an apply in between.
+    /// the script hook sees `vendor/` without an apply in between — or
+    /// `boxme composer install ++ php artisan test`.
     #[command(external_subcommand)]
     Run(Vec<String>),
 }

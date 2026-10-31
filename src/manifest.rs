@@ -149,8 +149,9 @@ pub fn expected_write_set_all(commands: &[Vec<String>]) -> WriteSet {
     WriteSet { dirs, files }
 }
 
-/// Expected write-set per command. `tool` is "composer" or "npm";
-/// `args` everything after it.
+/// Expected write-set per command. `tool` is "composer", "npm" or "php";
+/// `args` everything after it. A php command (tests, artisan) is expected to
+/// write nothing, so whatever it does write shows up for review.
 ///
 /// Every composer command may also write `composer-integrity.lock` (the
 /// base image's soak-time plugin records each installed version there, to be

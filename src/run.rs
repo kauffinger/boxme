@@ -104,8 +104,8 @@ enum Learned {
 struct RunCtx<'a> {
     cli: &'a Cli,
     project_dir: &'a Path,
-    /// The `++`-separated command chain; each entry is one composer/npm
-    /// invocation, run in order in the same guest as one changeset.
+    /// The `++`-separated command chain; each entry is one composer, npm or
+    /// php invocation, run in order in the same guest as one changeset.
     commands: &'a [Vec<String>],
     write_set: &'a WriteSet,
     php: &'a str,
@@ -244,7 +244,8 @@ fn conflicting_flags(cli: &Cli) -> Option<&'static str> {
 /// which must start with a supported tool. The chain runs sequentially in one
 /// guest and produces one combined changeset —
 /// `boxme composer install ++ composer run-script post-update-cmd` lets the
-/// script hook see `vendor/` without an apply in between.
+/// script hook see `vendor/` without an apply in between, and
+/// `boxme composer install ++ php artisan test` tests what was installed.
 fn split_commands(args: &[String]) -> Result<Vec<Vec<String>>> {
     let mut commands: Vec<Vec<String>> = vec![Vec::new()];
     for arg in args {
@@ -259,8 +260,8 @@ fn split_commands(args: &[String]) -> Result<Vec<Vec<String>>> {
     }
     for cmd in &commands {
         match cmd.first().map(String::as_str) {
-            Some("composer") | Some("npm") => {}
-            Some(tool) => bail!("boxme only wraps `composer` and `npm` (got `{tool}`)"),
+            Some("composer") | Some("npm") | Some("php") => {}
+            Some(tool) => bail!("boxme only wraps `composer`, `npm` and `php` (got `{tool}`)"),
             None => bail!("empty command in a `++` chain"),
         }
     }
@@ -598,7 +599,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     }
 
     // Match host versions.
-    if uses_tool(commands, "composer") {
+    if uses_tool(commands, "composer") || uses_tool(commands, "php") {
         let code = stream_shell_stderr(sb, &scripts::php_switch(php)).await?;
         if code != 0 {
             bail!("switching the guest to PHP {php} failed");
@@ -1322,9 +1323,14 @@ mod tests {
             ]
         );
 
+        assert_eq!(
+            split_commands(&args(&["composer", "i", "++", "php", "artisan", "test"])).unwrap(),
+            vec![args(&["composer", "i"]), args(&["php", "artisan", "test"])]
+        );
+
         // Every segment must be a supported tool, and no segment may be empty.
-        assert!(split_commands(&args(&["php", "artisan"])).is_err());
-        assert!(split_commands(&args(&["composer", "i", "++", "php", "-v"])).is_err());
+        assert!(split_commands(&args(&["bash", "-c", "id"])).is_err());
+        assert!(split_commands(&args(&["composer", "i", "++", "sh", "-c", "id"])).is_err());
         assert!(split_commands(&args(&["composer", "i", "++"])).is_err());
         assert!(split_commands(&args(&["++", "composer", "i"])).is_err());
     }
