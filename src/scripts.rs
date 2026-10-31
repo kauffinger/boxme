@@ -30,7 +30,10 @@ echo ">> installing PHP 8.3, 8.4 and 8.5 plus tooling (this is the slow part)"
 for v in 8.3 8.4 8.5; do
   apt-get install -y --no-install-recommends \
     php$v-cli php$v-mbstring php$v-xml php$v-curl php$v-sqlite3 php$v-zip php$v-bcmath php$v-intl \
-    php$v-mysql php$v-pgsql
+    php$v-mysql php$v-pgsql php$v-gd
+  # Apps that boot an Imagick image driver crash without it, but a PECL build
+  # can lag a new PHP release — missing it must not fail the whole setup.
+  apt-get install -y --no-install-recommends php$v-imagick || echo ">> php$v-imagick is not packaged yet, skipping"
 done
 update-alternatives --set php /usr/bin/php8.4 || true
 echo ">> installing Composer"
