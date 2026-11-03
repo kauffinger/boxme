@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use microsandbox::sandbox::exec::ExecEvent;
 use microsandbox::Sandbox;
 
@@ -150,39 +150,6 @@ pub async fn stream_shell_stderr(sb: &Sandbox, script: &str) -> Result<i32> {
     Ok(code)
 }
 
-/// Run a bash script inside the sandbox, forwarding its output stream-faithfully:
-/// guest stdout to host stdout, guest stderr to host stderr. Returns the exit
-/// code. This is `boxme exec`'s transport — unlike `stream_shell_stderr`, a
-/// caller can pipe the command's stdout.
-pub async fn stream_shell_split(sb: &Sandbox, script: &str) -> Result<i32> {
-    let mut handle = sb
-        .exec_stream_with("bash", |e| e.args(["-lc", script]))
-        .await?;
-
-    let mut code = -1;
-    let mut out_carry: Vec<u8> = Vec::new();
-    let mut err_carry: Vec<u8> = Vec::new();
-    while let Some(event) = handle.recv().await {
-        match event {
-            ExecEvent::Stdout(bytes) => forward(&mut out_carry, &bytes, &mut std::io::stdout()),
-            ExecEvent::Stderr(bytes) => forward(&mut err_carry, &bytes, &mut std::io::stderr()),
-            ExecEvent::Exited { code: c } => code = c,
-            ExecEvent::Failed(f) => return Err(anyhow!("command failed to start: {f:?}")),
-            _ => {}
-        }
-    }
-
-    Ok(code)
-}
-
-fn forward(carry: &mut Vec<u8>, bytes: &[u8], to: &mut impl Write) {
-    let data = decode_utf8_stream(carry, bytes);
-    if !data.is_empty() {
-        let _ = to.write_all(data.as_bytes());
-        let _ = to.flush();
-    }
-}
-
 /// Run a bash script inside the sandbox quietly, collecting stdout. Errors with
 /// the captured stderr when the script exits nonzero.
 pub async fn shell_capture(sb: &Sandbox, script: &str) -> Result<String> {
@@ -197,49 +164,6 @@ pub async fn shell_capture(sb: &Sandbox, script: &str) -> Result<String> {
         ));
     }
     Ok(output.stdout().unwrap_or_default())
-}
-
-/// Tar+gzip a host directory into `out_tgz` so it can be copied into a sandbox
-/// in one shot and unpacked there. Uses the `tar`/`flate2` crates (no host `tar`
-/// binary) and runs the compression on a blocking thread so it never stalls the
-/// async runtime — a large project tree can take a while.
-///
-/// Used only by the `dev` path — the review run mounts the project read-only via
-/// an overlay instead of taring it in. Top-level `vendor/`/`node_modules/` are
-/// always skipped: `dev` installs them Linux-native in the guest and never
-/// copies back, so shipping the host's (macOS) build in would be wrong as well
-/// as wasteful. Top level only: a nested one (e.g. Laravel's `public/vendor`) is
-/// real content.
-pub async fn tar_directory(dir: &Path, out_tgz: &Path) -> Result<()> {
-    let dir = dir.to_path_buf();
-    let out = out_tgz.to_path_buf();
-    let label = dir.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let file = std::fs::File::create(&out)?;
-        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-        let mut builder = tar::Builder::new(encoder);
-        // Store symlinks as symlinks, like the `tar` CLI does by default. The
-        // crate otherwise follows them, which turns `node_modules/.bin/*` links
-        // into stray file copies whose relative `require()`s then break.
-        builder.follow_symlinks(false);
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == "vendor" || name == "node_modules" {
-                continue;
-            }
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                builder.append_dir_all(&name, &path)?;
-            } else {
-                builder.append_path_with_name(&path, &name)?;
-            }
-        }
-        builder.into_inner()?.finish()?;
-        Ok(())
-    })
-    .await
-    .with_context(|| format!("packing {} failed", label.display()))?
 }
 
 #[cfg(test)]

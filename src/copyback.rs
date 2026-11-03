@@ -1,5 +1,4 @@
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use microsandbox::Sandbox;
@@ -33,12 +32,45 @@ pub struct Staged {
     deletions: Vec<String>,
 }
 
-impl Staged {
-    /// The host-side result tarball, if anything was packed. Surfaced so an
-    /// aborted copy-out can point the user at their not-yet-applied changes
-    /// instead of silently dropping them.
-    pub fn tarball(&self) -> Option<&Path> {
-        self.tgz.as_deref()
+/// Which staged paths an apply takes: everything, or only the given
+/// project-relative paths and whatever lies beneath them.
+pub struct Selection {
+    paths: Vec<String>,
+}
+
+impl Selection {
+    pub fn everything() -> Self {
+        Selection { paths: Vec::new() }
+    }
+
+    /// No paths selects everything. Each path is checked like a tarball entry,
+    /// so a selection can't name anything outside the project.
+    pub fn new(paths: &[String]) -> Result<Self> {
+        let mut normalized = Vec::new();
+        for original in paths {
+            let path = original.trim_start_matches("./").trim_end_matches('/');
+            if path.is_empty() || path == "." {
+                bail!("`{original}` selects the whole project — run `boxme apply` without paths");
+            }
+            safe_join(Path::new(""), path)?;
+            normalized.push(path.to_string());
+        }
+        Ok(Selection { paths: normalized })
+    }
+
+    pub fn is_everything(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn includes(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        self.is_everything()
+            || self.paths.iter().any(|selected| {
+                path == selected
+                    || path
+                        .strip_prefix(selected.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
     }
 }
 
@@ -127,6 +159,22 @@ pub fn load_staged(dir: &Path) -> Result<Staged> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {} failed", path.display()))
 }
 
+impl Staged {
+    /// Every path the changeset would write or delete.
+    pub fn paths(&self) -> Result<Vec<String>> {
+        let mut paths = self.deletions.clone();
+        if let Some(tgz) = &self.tgz {
+            let file = std::fs::File::open(tgz)
+                .with_context(|| format!("opening {} failed", tgz.display()))?;
+            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+            for entry in archive.entries()? {
+                paths.push(entry?.path()?.to_string_lossy().into_owned());
+            }
+        }
+        Ok(paths)
+    }
+}
+
 /// Rename, falling back to copy+remove for a cross-filesystem move (the staged
 /// tarball starts life in the system temp dir).
 fn move_file(from: &Path, to: &Path) -> Result<()> {
@@ -146,14 +194,14 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
 /// the operations least likely to fail part-way. Does *not* remove the source
 /// tarball — the caller drops it only once the whole operation has succeeded.
 /// Every target is confined to `base` (tarball content is sandbox-controlled).
-fn apply_staged(base: &Path, staged: &Staged) -> Result<()> {
+fn apply_staged(base: &Path, staged: &Staged, selection: &Selection) -> Result<()> {
     if let Some(host_tgz) = &staged.tgz {
         let scratch = base.join(format!(".boxme-apply-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch)
             .with_context(|| format!("creating {} failed", scratch.display()))?;
-        let swapped = extract(host_tgz, &scratch).and_then(|()| {
-            for dir in &staged.replace_dirs {
+        let swapped = extract(host_tgz, &scratch, selection).and_then(|()| {
+            for dir in staged.replace_dirs.iter().filter(|d| selection.includes(d)) {
                 if let Some(target) = contained_target(base, dir)? {
                     remove_contained(&target)?;
                 }
@@ -163,7 +211,7 @@ fn apply_staged(base: &Path, staged: &Staged) -> Result<()> {
         let _ = std::fs::remove_dir_all(&scratch);
         swapped?;
     }
-    for path in &staged.deletions {
+    for path in staged.deletions.iter().filter(|p| selection.includes(p)) {
         if let Some(target) = contained_target(base, path)? {
             remove_contained(&target)?;
         }
@@ -209,182 +257,22 @@ fn recovery_context(err: anyhow::Error, staged: &Staged) -> anyhow::Error {
     }
 }
 
-/// Apply a staged changeset to the project in place: replace the expected dirs
-/// wholesale, unpack the tarball, then apply deletions. Run only after the VM is
-/// gone, so the host tree is no longer a live overlay lower. All target paths are
-/// confined to the project dir (tarball content is sandbox-controlled).
-pub fn commit(project_dir: &Path, staged: Staged) -> Result<()> {
+/// Apply the selected part of a staged changeset to the project in place:
+/// replace the expected dirs wholesale, unpack the tarball, then apply
+/// deletions. Run only after the VM is gone, so the host tree is no longer a
+/// live overlay lower. All target paths are confined to the project dir
+/// (tarball content is sandbox-controlled).
+pub fn commit(project_dir: &Path, staged: Staged, selection: &Selection) -> Result<()> {
     // Resolve the project dir once so containment checks compare canonical
     // paths. Every destructive target is confined to this.
     let base = project_dir
         .canonicalize()
         .with_context(|| format!("canonicalizing {} failed", project_dir.display()))?;
-    apply_staged(&base, &staged).map_err(|e| recovery_context(e, &staged))?;
+    apply_staged(&base, &staged, selection).map_err(|e| recovery_context(e, &staged))?;
     if let Some(host_tgz) = &staged.tgz {
         let _ = std::fs::remove_file(host_tgz);
     }
     Ok(())
-}
-
-/// Which of `paths` (project-relative) currently have uncommitted changes on the
-/// host — the files an in-place copy-out would write over on top of the user's
-/// own edits. Empty when the tree is clean on those paths, or when `project_dir`
-/// isn't a git repo (nothing to protect). Asks git directly with the paths as a
-/// pathspec, so the answer is correct whether `project_dir` is the repo root or a
-/// subdirectory of one.
-pub fn collisions(project_dir: &Path, paths: &[String]) -> Result<Vec<String>> {
-    if paths.is_empty() || !is_git_repo(project_dir) {
-        return Ok(Vec::new());
-    }
-    let mut args: Vec<&str> = vec!["status", "--porcelain", "-z", "--"];
-    args.extend(paths.iter().map(String::as_str));
-    let out = git(project_dir, &args)?;
-    Ok(porcelain_paths(&out))
-}
-
-/// Land a staged changeset as a single commit on a fresh branch *without* ever
-/// reading or writing the user's working tree — the `boxme claude` branch
-/// fallback, taken when an in-place copy-out would overwrite the user's own
-/// uncommitted edits. A throwaway git worktree is checked out at HEAD in a temp
-/// dir, the agent's files are written and committed there (`--no-verify`: the
-/// content is sandbox-produced, and a failing hook shouldn't drop the agent's
-/// work), and the worktree is removed — leaving only the new branch. The working
-/// tree and index the user is sitting on are untouched, so their in-progress
-/// edits survive verbatim. Returns the (possibly uniquified) branch name, or
-/// `None` if there was nothing to commit. Run only after the VM is gone.
-pub fn commit_to_branch(
-    project_dir: &Path,
-    staged: Staged,
-    message: &str,
-    branch: &str,
-) -> Result<Option<String>> {
-    if staged.tgz.is_none() && staged.replace_dirs.is_empty() && staged.deletions.is_empty() {
-        return Ok(None);
-    }
-    let base = project_dir
-        .canonicalize()
-        .with_context(|| format!("canonicalizing {} failed", project_dir.display()))?;
-    if !git_ok(&base, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
-        bail!(
-            "can't create a branch — this repo has no commits yet.\n\
-             commit something first, then re-run; your changes are staged at {}",
-            staged
-                .tgz
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(nothing packed)".to_string())
-        );
-    }
-
-    let branch = unique_branch(&base, branch);
-    let worktree = std::env::temp_dir().join(format!("boxme-wt-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&worktree);
-    let wt = worktree.to_string_lossy().into_owned();
-    git(&base, &["worktree", "add", "-b", &branch, &wt, "HEAD"])
-        .with_context(|| format!("creating worktree for branch {branch} failed"))?;
-
-    let result = (|| -> Result<()> {
-        let wt_base = worktree
-            .canonicalize()
-            .with_context(|| format!("canonicalizing {} failed", worktree.display()))?;
-        apply_staged(&wt_base, &staged)?;
-        git(&wt_base, &["add", "-A"])?;
-        git(&wt_base, &["commit", "--no-verify", "-m", message])?;
-        Ok(())
-    })();
-
-    // Always tear the worktree down (the branch it created survives); only drop
-    // the tarball once we know the commit landed, so a failure leaves it for
-    // recovery.
-    let _ = git(&base, &["worktree", "remove", "--force", &wt]);
-    let _ = std::fs::remove_dir_all(&worktree);
-    result.map_err(|e| recovery_context(e, &staged))?;
-    if let Some(host_tgz) = &staged.tgz {
-        let _ = std::fs::remove_file(host_tgz);
-    }
-    Ok(Some(branch))
-}
-
-/// Run `git -C <dir> <args>`, returning stdout. Errors carry git's stderr.
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .with_context(|| format!("running `git {}`", args.join(" ")))?;
-    if !output.status.success() {
-        bail!(
-            "`git {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Like [`git`] but reports only whether the command *succeeded*, swallowing any
-/// error — for existence probes where a non-zero exit is an expected answer, not
-/// a failure.
-fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn is_git_repo(dir: &Path) -> bool {
-    git_ok(dir, &["rev-parse", "--is-inside-work-tree"])
-}
-
-fn branch_exists(base: &Path, name: &str) -> bool {
-    git_ok(
-        base,
-        &[
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{name}"),
-        ],
-    )
-}
-
-/// First free branch name at or after `desired` (`name`, `name-2`, `name-3`, …),
-/// so a second run in the same second — or a leftover branch — bumps the suffix
-/// instead of aborting the commit.
-fn unique_branch(base: &Path, desired: &str) -> String {
-    if !branch_exists(base, desired) {
-        return desired.to_string();
-    }
-    for n in 2.. {
-        let candidate = format!("{desired}-{n}");
-        if !branch_exists(base, &candidate) {
-            return candidate;
-        }
-    }
-    unreachable!()
-}
-
-/// Pull the file paths out of `git status --porcelain -z` output. Each record is
-/// NUL-terminated and prefixed with a two-char status code + space (`" M file"`,
-/// `"?? file"`); a rename emits the destination as a prefixed record and the
-/// source as a bare follow-on. We only need the touched paths, so strip the
-/// prefix when present and keep bare records as-is. `-z` means paths are literal
-/// (never quoted), so this is a clean split.
-fn porcelain_paths(out: &str) -> Vec<String> {
-    out.split('\0')
-        .filter(|r| !r.is_empty())
-        .map(|record| {
-            if record.len() > 3 && record.as_bytes()[2] == b' ' {
-                record[3..].to_string()
-            } else {
-                record.to_string()
-            }
-        })
-        .collect()
 }
 
 /// Remove a target without following a final-component symlink: a symlink is
@@ -429,7 +317,7 @@ fn contained_target(base: &Path, rel: &str) -> Result<Option<PathBuf>> {
 /// of `unpack_in`'s own containment. Link entries are guest-authored too: their
 /// *target* is validated as well, so copy-back can't plant a symlink pointing
 /// outside the project dir (e.g. `innocuous.txt -> /Users/you/.ssh/id_rsa`).
-fn extract(tgz: &Path, dest: &Path) -> Result<()> {
+fn extract(tgz: &Path, dest: &Path, selection: &Selection) -> Result<()> {
     let file = std::fs::File::open(tgz)?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
@@ -463,7 +351,9 @@ fn extract(tgz: &Path, dest: &Path) -> Result<()> {
                 );
             }
         }
-        entry.unpack_in(dest)?;
+        if selection.includes(&path.to_string_lossy()) {
+            entry.unpack_in(dest)?;
+        }
     }
     Ok(())
 }
@@ -513,34 +403,6 @@ fn safe_join(base: &Path, rel: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn porcelain_paths_strips_status_and_keeps_bare_records() {
-        // Modified, untracked, staged-add, and a rename (dest prefixed, source bare).
-        let out = " M composer.lock\0?? app/New.php\0A  src/added.rs\0R  to/new.rs\0from/old.rs\0";
-        let paths = porcelain_paths(out);
-        assert_eq!(
-            paths,
-            vec![
-                "composer.lock",
-                "app/New.php",
-                "src/added.rs",
-                "to/new.rs",
-                "from/old.rs",
-            ]
-        );
-    }
-
-    #[test]
-    fn porcelain_paths_empty_when_clean() {
-        assert!(porcelain_paths("").is_empty());
-    }
-
-    #[test]
-    fn porcelain_paths_preserves_spaces_in_names() {
-        let out = " M dir/a file.txt\0";
-        assert_eq!(porcelain_paths(out), vec!["dir/a file.txt"]);
-    }
 
     #[test]
     fn persist_then_load_roundtrips_and_moves_the_tarball() {
@@ -628,7 +490,7 @@ mod tests {
             replace_dirs: vec!["vendor".to_string()],
             deletions: vec!["old.txt".to_string()],
         };
-        commit(&project, staged).unwrap();
+        commit(&project, staged, &Selection::everything()).unwrap();
 
         assert!(
             !project.join("vendor/stale.txt").exists(),
@@ -666,6 +528,77 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_applies_only_the_named_paths() {
+        let dir = std::env::temp_dir().join(format!("boxme-select-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = seeded_project(
+            &dir,
+            &[
+                ("vendor/stale.txt", "stale"),
+                ("CLAUDE.md", "mine"),
+                ("old.txt", "keep me"),
+                ("public/build/old.js", "delete me"),
+            ],
+        );
+        let tgz = file_tarball(
+            &dir,
+            &[
+                ("vendor/new.txt", "new"),
+                ("composer.lock", "lock"),
+                ("CLAUDE.md", "boost rewrote this"),
+                ("public/build/app.js", "built"),
+            ],
+        );
+        let staged = Staged {
+            tgz: Some(tgz),
+            replace_dirs: vec!["vendor".to_string()],
+            deletions: vec!["old.txt".to_string(), "public/build/old.js".to_string()],
+        };
+        let selection =
+            Selection::new(&["./composer.lock".to_string(), "public/".to_string()]).unwrap();
+
+        assert_eq!(
+            staged
+                .paths()
+                .unwrap()
+                .into_iter()
+                .filter(|p| selection.includes(p))
+                .collect::<Vec<_>>(),
+            vec![
+                "public/build/old.js",
+                "composer.lock",
+                "public/build/app.js"
+            ]
+        );
+        commit(&project, staged, &selection).unwrap();
+
+        let read = |path: &str| std::fs::read_to_string(project.join(path)).unwrap();
+        assert_eq!(read("composer.lock"), "lock");
+        assert_eq!(read("public/build/app.js"), "built");
+        assert!(!project.join("public/build/old.js").exists());
+        assert_eq!(read("CLAUDE.md"), "mine");
+        assert_eq!(read("old.txt"), "keep me");
+        assert_eq!(read("vendor/stale.txt"), "stale", "vendor/ wasn't selected");
+        assert!(!project.join("vendor/new.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_selection_matches_whole_path_components_and_stays_in_the_project() {
+        let selection = Selection::new(&["public".to_string()]).unwrap();
+        assert!(selection.includes("public"));
+        assert!(selection.includes("public/build/"));
+        assert!(!selection.includes("public-assets/app.js"));
+        assert!(Selection::everything().includes("anything/at/all"));
+
+        assert!(Selection::new(&["../outside".to_string()]).is_err());
+        assert!(Selection::new(&["/etc/passwd".to_string()]).is_err());
+        assert!(Selection::new(&["./".to_string()]).is_err());
+    }
+
+    #[test]
     fn failed_commit_leaves_the_project_untouched_and_points_at_the_tarball() {
         let dir =
             std::env::temp_dir().join(format!("boxme-commit-fail-test-{}", std::process::id()));
@@ -680,7 +613,7 @@ mod tests {
             replace_dirs: vec!["vendor".to_string()],
             deletions: Vec::new(),
         };
-        let err = commit(&project, staged).unwrap_err();
+        let err = commit(&project, staged, &Selection::everything()).unwrap_err();
 
         assert!(
             project.join("vendor/stale.txt").exists(),
@@ -727,7 +660,7 @@ mod tests {
         let tgz = link_tarball(&dir, links);
         let dest = dir.join("project");
         std::fs::create_dir_all(&dest).unwrap();
-        extract(&tgz, &dest).map(|()| dest)
+        extract(&tgz, &dest, &Selection::everything()).map(|()| dest)
     }
 
     #[test]

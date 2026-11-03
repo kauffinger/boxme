@@ -30,7 +30,10 @@ echo ">> installing PHP 8.3, 8.4 and 8.5 plus tooling (this is the slow part)"
 for v in 8.3 8.4 8.5; do
   apt-get install -y --no-install-recommends \
     php$v-cli php$v-mbstring php$v-xml php$v-curl php$v-sqlite3 php$v-zip php$v-bcmath php$v-intl \
-    php$v-mysql php$v-pgsql
+    php$v-mysql php$v-pgsql php$v-gd
+  # Apps that boot an Imagick image driver crash without it, but a PECL build
+  # can lag a new PHP release — missing it must not fail the whole setup.
+  apt-get install -y --no-install-recommends php$v-imagick || echo ">> php$v-imagick is not packaged yet, skipping"
 done
 update-alternatives --set php /usr/bin/php8.4 || true
 echo ">> installing Composer"
@@ -57,11 +60,6 @@ composer global config allow-plugins.innobrain/soak-time true
 composer global require innobrain/soak-time --prefer-source --no-interaction
 echo ">> upgrading npm (need >= 11.10.0 for min-release-age cooldown)"
 npm install -g npm@latest
-echo ">> installing Claude Code (@anthropic-ai/claude-code) for \`boxme claude\`"
-# npm >= 12 blocks install scripts by default; claude-code's postinstall is what
-# downloads the native `claude` binary, so without this the install "succeeds"
-# but `claude` bails with "native binary not installed".
-npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code
 echo ">> enabling npm min-release-age (supply-chain safety: 7-day cooldown on new packages)"
 npm config set min-release-age 7 --location=global
 echo ">> installing n (Node version switcher; downloads land on the boxme-node-versions volume)"
@@ -74,7 +72,6 @@ echo "default: $(php -v | head -1)"
 composer --version
 echo "node $(node -v) / npm $(npm -v)"
 echo "npm min-release-age: $(npm config get min-release-age --location=global) day(s)"
-echo "claude $(claude --version 2>/dev/null || echo '(not installed)')"
 echo ">> base image ready"
 "#;
 
@@ -130,138 +127,10 @@ git config --global --add safe.directory /workspace
 git config --global core.hooksPath /dev/null
 git init -q
 git add -Af -- . ':(exclude).git' ':(exclude)vendor' ':(exclude)node_modules'
-git -c user.email=boxme@local -c user.name=boxme commit --no-verify -qm "boxme baseline" || true
+git -c user.email=boxme@local -c user.name=boxme commit --allow-empty --no-verify -qm "boxme baseline"
 git tag -f boxme-baseline HEAD >/dev/null
 echo ">> project mounted (overlay), baseline tagged"
 "#;
-
-/// Extract the host tarball into /workspace for a `dev` session. Unlike
-/// `UNPACK`, no git baseline is tagged: a dev run never diffs or copies back, so
-/// the (potentially slow on a big repo) baseline commit is pure overhead.
-pub const DEV_UNPACK: &str = r#"
-set -e
-mkdir -p /workspace
-tar --no-same-owner -xzf /tmp/repo.tgz -C /workspace
-rm -f /tmp/repo.tgz
-echo ">> project unpacked into /workspace"
-"#;
-
-/// Install composer dependencies in the guest before the dev stack runs. The
-/// install happens *in the guest*, so it pulls the Linux-native artifacts the
-/// guest will actually run — no host-platform retargeting (the opposite of the
-/// copy-back `npm install` path). Dev dependencies are kept: `composer run dev`
-/// needs pail/sail/etc.
-pub const COMPOSER_INSTALL: &str = "cd /workspace && composer install --no-interaction";
-
-/// Install npm dependencies in the guest before the dev stack runs. Linux-native
-/// by design — node_modules stays in the guest and is executed there, never
-/// copied back to the host.
-pub const NPM_INSTALL: &str = "cd /workspace && npm install";
-
-/// Bridge each forwarded guest port onto the guest's external interface so a dev
-/// server that binds only `127.0.0.1` (artisan serve and Vite both do by
-/// default) is still reachable through microsandbox's host→guest port forward,
-/// which dials the guest's eth0 IP. The proxy binds `<eth0-ip>:PORT`, which does
-/// not collide with the app's `127.0.0.1:PORT`; if a server already binds
-/// `0.0.0.0:PORT` the proxy's bind fails harmlessly (`.on('error')`) since the
-/// port is reachable directly. Ports come from a host-parsed `u16` list, never
-/// guest input. Started in the background; they die with the VM.
-pub fn port_bridge(ports: &[u16]) -> String {
-    let mut script = String::from(
-        r#"cat > /tmp/boxme-proxy.js <<'PROXY'
-const net = require('net');
-const port = Number(process.argv[2]);
-const ip = process.argv[3];
-net.createServer((s) => {
-  const u = net.connect(port, '127.0.0.1');
-  s.pipe(u);
-  u.pipe(s);
-  const done = () => { s.destroy(); u.destroy(); };
-  s.on('error', done);
-  u.on('error', done);
-}).on('error', () => {}).listen(port, ip);
-PROXY
-GUEST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-if [ -n "$GUEST_IP" ]; then
-"#,
-    );
-    for p in ports {
-        script.push_str(&format!(
-            "  node /tmp/boxme-proxy.js {p} \"$GUEST_IP\" >/dev/null 2>&1 &\n"
-        ));
-    }
-    script.push_str("fi\n");
-    script
-}
-
-/// First-run config seeded into the fresh guest before Claude Code launches.
-///
-/// A valid token authenticates the agent, but on a brand-new `/root/.claude.json`
-/// Claude Code still runs the first-run wizard (theme + login) and the per-project
-/// "trust this folder" dialog regardless of the token — which is what lands the
-/// user on a setup/login screen. These keys mark onboarding complete and
-/// `/workspace` trusted so the session opens straight to a usable prompt.
-/// `--dangerously-skip-permissions` notably does *not* suppress the trust dialog
-/// (upstream bug), hence the explicit project entry. `lastOnboardingVersion` is
-/// set to the guest's actual claude version so an onboarding-flow bump can still
-/// re-trigger it intentionally. The auto-mode opt-in keys pre-accept the prompt
-/// `--permission-mode auto` can show on first use (best-effort: harmless if the
-/// real keys differ). Written fresh each boot since the guest is throwaway.
-const CLAUDE_SEED: &str = r#"
-mkdir -p /root/.claude
-CLAUDE_VERSION="$(claude --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)"
-cat > /root/.claude.json <<EOF
-{
-  "hasCompletedOnboarding": true,
-  "lastOnboardingVersion": "${CLAUDE_VERSION:-2.1.185}",
-  "theme": "dark",
-  "hasResetAutoModeOptInForDefaultOffer": true,
-  "autoPermissionsNotificationCount": 99,
-  "projects": {
-    "/workspace": {
-      "hasTrustDialogAccepted": true,
-      "hasTrustDialogHooksAccepted": true,
-      "hasCompletedProjectOnboarding": true
-    }
-  }
-}
-EOF
-cat > /root/.claude/settings.json <<EOF
-{
-  "skipDangerousModePermissionPrompt": true
-}
-EOF
-"#;
-
-/// Launch Claude Code inside the guest against the mounted `/workspace`.
-///
-/// Permission mode is chosen per path. An **interactive** session (no prompt) runs
-/// under `--permission-mode auto`: it's attached to the user's TTY, so auto mode's
-/// classifier is a safety net the user can answer, and it needs no root-bypass and
-/// shows no bypass-mode warning screen. A **headless** run (`-p`) is unattended, so
-/// it uses `--dangerously-skip-permissions` — auto mode would *abort* a headless
-/// session when its classifier blocks a legitimate action (a postinstall script, a
-/// git reset), and the sandbox is already the safety boundary. bypass refuses to
-/// run as root unless `IS_SANDBOX=1`, which auto mode tolerates but doesn't need.
-///
-/// `DISABLE_AUTOUPDATER` pins the baked claude version, and
-/// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` drops telemetry/error reporting.
-/// `CLAUDE_SEED` runs first so the agent skips onboarding and lands in a session.
-pub fn claude_run(prompt: Option<&str>) -> String {
-    let invocation = match prompt {
-        Some(p) => format!(
-            "claude --dangerously-skip-permissions -p {}",
-            shell_quote(p)
-        ),
-        None => "claude --permission-mode auto".to_string(),
-    };
-    format!(
-        "{RAISE_FDS}\n\
-         {CLAUDE_SEED}\n\
-         export IS_SANDBOX=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n\
-         cd /workspace && exec {invocation}"
-    )
-}
 
 /// Switch the guest's `php` alternative to the requested version. The version
 /// is interpolated into shell, but it's validated against `PHP_VERSIONS` first.
@@ -301,29 +170,33 @@ echo ">> using node $(node -v)"
 /// `fs.nr_open`, and `|| true` keeps a refusal from aborting the command.
 pub const RAISE_FDS: &str = "ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true";
 
-/// Raise the inotify watch ceiling before a `dev` stack starts. Vite/chokidar
-/// recursively watch /workspace (vendor/ and node_modules/ included), and the
-/// Linux default `fs.inotify.max_user_watches` (8192) is far too low for a real
-/// Laravel + node tree — Vite aborts with `ENOSPC: System limit for number of
-/// file watchers reached`. The guest is root, so it can raise the sysctls; `||
-/// true` keeps a refusal (e.g. a read-only /proc/sys) from aborting the run.
-pub const RAISE_INOTIFY: &str = "sysctl -w fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=1024 >/dev/null 2>&1 || true";
-
 /// Point npm's optional-dependency resolver at the host platform instead of the
 /// Linux guest it actually runs in. npm only installs the platform-gated
 /// optional deps (`@esbuild/*`, `@rollup/rollup-*`, `lightningcss`, `@swc/core`,
 /// `sharp`'s prebuilds, …) whose `os`/`cpu` match where npm runs — so a guest
 /// install drops the macOS binaries the host will try to load. `os`/`cpu` come
 /// from a fixed host-side whitelist (`darwin` + `arm64`/`x64`), never guest
-/// input, so they need no quoting.
-pub fn npm_platform_env(os: &str, cpu: &str) -> String {
-    format!("export npm_config_os={os} npm_config_cpu={cpu}; ")
+/// input, so they need no quoting. `None` leaves that variable to the user's
+/// own `-e` pin.
+pub fn npm_platform_env(os: Option<&str>, cpu: Option<&str>) -> String {
+    let mut exports = Vec::new();
+    if let Some(os) = os {
+        exports.push(format!("npm_config_os={os}"));
+    }
+    if let Some(cpu) = cpu {
+        exports.push(format!("npm_config_cpu={cpu}"));
+    }
+    if exports.is_empty() {
+        return String::new();
+    }
+    format!("export {}; ", exports.join(" "))
 }
 
-/// File manifest of /workspace: every entry's size/type/path, then an md5 of
-/// every regular file (content hashing kills mtime noise). vendor/,
-/// node_modules/ and .git are excluded — the expected dirs are summarized by
-/// count separately.
+/// File manifest of /workspace: every entry's size/type/symlink-target/path,
+/// then an md5 of every regular file (content hashing kills mtime noise).
+/// vendor/, node_modules/ and .git are excluded — the expected dirs are
+/// summarized by count separately. The symlink target (`%l`, empty for
+/// anything but a symlink) is what lets a retargeted link show up as a change.
 ///
 /// Everything is NUL-delimited and the path is the last field of each record,
 /// so filenames containing tabs or newlines can't inject or truncate manifest
@@ -342,7 +215,7 @@ pub fn npm_platform_env(os: &str, cpu: &str) -> String {
 pub const MANIFEST: &str = r#"
 cd /workspace
 printf '#FILES\0'
-find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -printf '%s\t%y\t%P\0' 2>/dev/null
+find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -printf '%s\t%y\t%l\t%P\0' 2>/dev/null
 printf '#MD5\0'
 find /workspace -mindepth 1 \( -path /workspace/.git -o -path /workspace/vendor -o -path /workspace/node_modules \) -prune -o -type f -print0 2>/dev/null | xargs -0 -r md5sum -z 2>/dev/null
 exit 0
@@ -351,6 +224,19 @@ exit 0
 /// Count files inside an expected dir (for the "vendor/: 4321 files" summary).
 pub fn count_files(dir: &str) -> String {
     format!("find /workspace/{dir} -type f 2>/dev/null | wc -l")
+}
+
+/// Print each of the expected dirs the command wrote into. The overlay upper
+/// holds an entry for a dir once anything beneath it is added, changed or
+/// deleted, and the file manifest skips these dirs, so this is how a failed
+/// run's partial `vendor/` is noticed. Fails if the upper is missing, so a
+/// broken check never reads as "nothing written".
+pub fn written_dirs(dirs: &[&str]) -> String {
+    let quoted: Vec<String> = dirs.iter().map(|dir| shell_quote(dir)).collect();
+    format!(
+        "cd /boxme-upper/upper || exit 1; ls -d -- {} 2>/dev/null; exit 0",
+        quoted.join(" ")
+    )
 }
 
 /// Marker whose mtime is the cutoff for the out-of-workspace change scan.
@@ -376,14 +262,15 @@ pub const BASELINE_MARKER: &str = "/root/.boxme-outside-baseline";
 /// agentd writes /etc/hosts, /etc/hostname and /etc/resolv.conf on its own
 /// schedule, which races the baseline marker, and `/.msb` is the agent's
 /// runtime dir. When TLS interception is on (`--composer-auth`) the agent also
-/// installs the proxy CA into the guest trust store, so those paths are pruned
-/// too — but only then, so a rogue CA install by a postinstall script still
+/// installs the proxy CA into the guest trust stores (Debian's and the
+/// RHEL-style `/etc/pki`), so those paths are pruned too — but only then, so a rogue CA install by a postinstall script still
 /// shows up in a normal run. Trading a little blind spot in those for signal
 /// in the rest of the tree. Output is `size\ttype\tpath`; a missing marker
 /// prints `#NOMARKER`.
 pub fn outside_scan(tls_intercepting: bool) -> String {
     let ca_prunes = if tls_intercepting {
-        " -o -path /etc/ssl/certs -o -path /usr/local/share/ca-certificates \\
+        " -o -path /etc/ssl/certs -o -path /etc/ssl/cert.pem -o -path /etc/pki \\
+     -o -path /usr/local/share/ca-certificates \\
      -o -path /etc/ca-certificates.conf -o -path /etc/ca-certificates"
     } else {
         ""
@@ -417,21 +304,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interactive_uses_auto_headless_uses_bypass() {
-        let interactive = claude_run(None);
-        assert!(interactive.contains("claude --permission-mode auto"));
-        assert!(!interactive.contains("--dangerously-skip-permissions"));
-
-        let headless = claude_run(Some("fix it"));
-        assert!(headless.contains("claude --dangerously-skip-permissions -p"));
-        assert!(headless.contains("fix it"));
-
-        // Both seed onboarding + workspace trust before launching.
-        for script in [&interactive, &headless] {
-            assert!(script.contains("\"hasCompletedOnboarding\": true"));
-            assert!(script.contains("\"/workspace\""));
-            assert!(script.contains("\"hasTrustDialogAccepted\": true"));
-        }
+    fn npm_platform_env_exports_only_what_is_given() {
+        assert_eq!(
+            npm_platform_env(Some("darwin"), Some("arm64")),
+            "export npm_config_os=darwin npm_config_cpu=arm64; "
+        );
+        assert_eq!(
+            npm_platform_env(None, Some("arm64")),
+            "export npm_config_cpu=arm64; "
+        );
+        assert_eq!(npm_platform_env(None, None), "");
     }
 
     #[test]
@@ -443,8 +325,22 @@ mod tests {
             }
         }
         // The trust store is pruned only under TLS interception, so a rogue CA
-        // install still shows up in a normal run.
-        assert!(outside_scan(true).contains("-path /etc/ssl/certs"));
-        assert!(!outside_scan(false).contains("-path /etc/ssl/certs"));
+        // install still shows up in a normal run. Every store the guest agent
+        // writes its CA into is covered, Debian's and the RHEL-style /etc/pki.
+        for path in [
+            "/etc/ssl/certs",
+            "/etc/ssl/cert.pem",
+            "/etc/pki",
+            "/usr/local/share/ca-certificates",
+        ] {
+            assert!(
+                outside_scan(true).contains(&format!("-path {path}")),
+                "{path}"
+            );
+            assert!(
+                !outside_scan(false).contains(&format!("-path {path}")),
+                "{path}"
+            );
+        }
     }
 }

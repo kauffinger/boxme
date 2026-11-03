@@ -30,7 +30,7 @@ This skill does general updates. If the user only wants vulnerabilities fixed
      running npm there would corrupt the lockfile setup).
    - A repo can be both.
 4. Dirty-file guard: in each git repo, run
-   `git status --porcelain -- composer.json composer.lock package.json package-lock.json`.
+   `git status --porcelain -- composer.json composer.lock composer-integrity.lock package.json package-lock.json`.
    If any of those are locally modified, skip the repo and report it — the
    in-place `boxme apply` would clobber the user's uncommitted edits.
 5. If the very first boxme run fails with "base snapshot missing", tell the user
@@ -60,6 +60,13 @@ stages one combined changeset.
    plausibly needs credentials and the host has a global composer `auth.json`).
 2. Handle the exit code (see "Exit codes and findings" below); on success,
    `boxme apply`.
+   If it exits 2 and the log shows both `[Soak Time] Filtered out` and
+   `not loaded, because they are affected by security advisories`, a
+   dependency's security fix is younger than the soak window, so every
+   version composer may install is advisory-blocked. Re-run once with
+   `composer update --no-security-blocking`: everything else updates and the
+   blocked package stays on its newest soaked release. Report that package as
+   "fix still soaking" — the next sweep picks it up.
 3. After a successful apply, note what is still vulnerable for the final
    report — **host-side is OK here** because this exact invocation executes no
    project code: `composer audit --locked --no-plugins --format=json`.
@@ -81,6 +88,10 @@ stages one combined changeset.
 `boxme --json` prints a `Report` (schema 1) to stdout and exits:
 
 - **0 — clean.** Nothing needs a second look: run `boxme apply`.
+  `packages[]` lists every version the run changed (`manager`, `name`,
+  `from`, `to`, `change`: `major`/`minor`/`patch`/`downgrade`/`changed`/
+  `added`/`removed`) — use it for the final report instead of diffing
+  lockfiles.
 - **2 — the guest command itself failed.** Nothing was staged. Record the tail
   of `boxme.log` for the final report and move on to the next repo.
 - **3 — findings.** The changeset is staged under `.boxme/pending/` (with a
@@ -92,8 +103,10 @@ stages one combined changeset.
     `.npmrc` — allow it and retry once:
     `boxme discard && boxme allow <host> && boxme --json <same command>`.
     Any other blocked host: leave the changeset staged, report it, move on.
-  - `unexpected_files`: inspect before deciding. Read each `files[]` entry
-    with `expected: false` — its `diff` in the report when present, otherwise
+  - `unexpected_files`: inspect before deciding. (What an update legitimately
+    regenerates — lockfiles, `composer-integrity.lock`, Laravel's
+    `bootstrap/cache/{packages,services}.php` — is already `expected` and never
+    raises this.) Read each `files[]` entry with `expected: false` — its `diff` in the report when present, otherwise
     the staged content via
     `tar xzf .boxme/pending/changeset.tgz -O -- <path>`. Inspection is
     **read-only**: never execute, source, or import anything from a staged
@@ -130,14 +143,17 @@ End with a per-repo summary the user can act on:
 | repo | composer | npm | still vulnerable (breaking to fix) | needs review |
 |------|----------|-----|------------------------------------|--------------|
 
+- The composer/npm columns summarize the applied report's `packages[]`
+  ("14 updated: 2 minor, 12 patch"). Call out every `major` and `downgrade`
+  by name — an in-range update rarely makes either, so they deserve a look.
+
 - "needs review" rows must include the finding kind, the offending
   hosts/files, and the exact follow-up commands:
   `cd <repo> && tar tzf .boxme/pending/changeset.tgz` to inspect,
   then `boxme apply` or `boxme discard`.
 - List every still-vulnerable advisory with package, installed version, and
   the advisory title, so the user can schedule the breaking upgrades
-  deliberately (e.g. with `boxme claude 'upgrade <pkg> to <major> and fix the
-  breakage'`).
+  deliberately.
 - Report failures truthfully: a repo whose command failed is "failed", not
   "skipped".
 

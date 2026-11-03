@@ -671,7 +671,6 @@ dependencies = [
  "libc",
  "microsandbox",
  "microsandbox-network",
- "notify",
  "owo-colors",
  "ratatui",
  "serde",

@@ -11,6 +11,7 @@ use owo_colors::OwoColorize;
 use serde::Serialize;
 
 use crate::copyback;
+use crate::packages::PackageChange;
 
 /// Where a `--json` run stages its changeset, relative to the project dir.
 /// The dir carries a `*` .gitignore so it can never be committed by accident.
@@ -45,6 +46,9 @@ pub struct Report {
     pub expected_dirs: Vec<DirSummary>,
     /// Every other changed path, with its diff where one was captured.
     pub files: Vec<FileChange>,
+    /// Package versions that changed, read from the lockfiles before and
+    /// after the run: what an update actually updated.
+    pub packages: Vec<PackageChange>,
     pub network: Network,
     pub outside: Outside,
     /// Present when a changeset was staged: where it is and how to decide on it.
@@ -202,23 +206,41 @@ pub fn save_report_copy(project_dir: &Path, json: &str) {
     }
 }
 
-/// `boxme apply` — copy the staged changeset into the project and drop the
-/// pending dir. The explicit second step of the `--json` flow.
-pub fn apply(json: bool) -> Result<()> {
+/// `boxme apply [PATH…]` — copy the staged changeset (or only the given paths
+/// of it) into the project and drop the pending dir. The explicit second step
+/// of the `--json` flow. Paths that match nothing staged are refused, and the
+/// changeset stays staged, so a typo can't throw it away.
+pub fn apply(paths: &[String], json: bool) -> Result<()> {
     let project_dir = std::env::current_dir()?;
     let dir = pending_dir(&project_dir);
     if !dir.join("staged.json").exists() {
         bail!("nothing staged — run `boxme --json composer …` (or npm) first");
     }
     let staged = copyback::load_staged(&dir)?;
-    copyback::commit(&project_dir, staged)?;
+    let selection = copyback::Selection::new(paths)?;
+    if !selection.is_everything() && !staged.paths()?.iter().any(|p| selection.includes(p)) {
+        bail!(
+            "nothing staged matches {} — the changeset stays staged (`tar tzf {PENDING_DIR}/changeset.tgz` lists it)",
+            paths.join(", ")
+        );
+    }
+    copyback::commit(&project_dir, staged, &selection)?;
     let _ = std::fs::remove_dir_all(&dir);
     if json {
-        println!("{}", serde_json::json!({ "applied": true }));
-    } else {
+        println!("{}", serde_json::json!({ "applied": true, "paths": paths }));
+    } else if selection.is_everything() {
         eprintln!(
             "{}",
             "applied — staged changeset copied into the project".green()
+        );
+    } else {
+        eprintln!(
+            "{}",
+            format!(
+                "applied {} — the rest of the staged changeset was dropped",
+                paths.join(", ")
+            )
+            .green()
         );
     }
     Ok(())
@@ -259,6 +281,7 @@ mod tests {
             findings: vec![],
             expected_dirs: vec![],
             files: vec![],
+            packages: vec![],
             network: Network {
                 banner: None,
                 contacts: vec![],

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{bail, Context, Result};
 use microsandbox::sandbox::{SandboxBuilder, SandboxStatus};
 use microsandbox::setup::{
@@ -10,25 +12,60 @@ use crate::util::stream_shell_stderr;
 
 /// Snapshot every boxme run boots from. Built once, reused for fast boots.
 pub const BASE_SNAPSHOT: &str = "boxme-base";
-pub(crate) const BUILDER: &str = "boxme-base-builder";
+/// The local snapshot group `boxme setup` captures the base snapshot into.
+const SNAPSHOT_GROUP: &str = "boxme";
+const BUILDER: &str = "boxme-base-builder";
 
 /// A sandbox builder that cold-boots `name` from the base snapshot.
 ///
 /// microsandbox 0.7 moved snapshot boots to `Sandbox::restore`, but that
 /// builder deliberately has no `env`, `secret_entry`, TLS settings, `replace`
-/// or attached mode — all of which every boxme boot needs (credentials and
-/// composer-auth placeholders, crash-SIGTERM). The full creation builder still
+/// or attached mode — all of which every boxme boot needs (env, composer-auth
+/// placeholders, crash-SIGTERM). The full creation builder still
 /// resolves a snapshot source through `override_snapshot` (hidden from the docs;
 /// it's what the `msb` CLI uses for config-file snapshot sources), so boot
 /// through that. `BASE_SNAPSHOT` is a disk snapshot, so this is a fresh boot
 /// of the captured disk, not a resumed VM.
-pub(crate) fn base_builder(name: &str) -> SandboxBuilder {
-    Sandbox::builder(name).override_snapshot(BASE_SNAPSHOT)
+///
+/// The snapshot is selected by its artifact path, not its name: since 0.7.8 a
+/// bare name selects a snapshot *group's head*, and neither a base built before
+/// 0.7.8 (an ungrouped artifact, which a bare name now refuses to open) nor a
+/// rebuilt one (a new root, which doesn't advance the head) is reachable that way.
+pub(crate) async fn base_builder(name: &str) -> Result<SandboxBuilder> {
+    let path = base_snapshot_path()
+        .await?
+        .context("base snapshot missing — run `boxme setup` first")?;
+    Ok(Sandbox::builder(name).override_snapshot(path.display().to_string()))
 }
 
 pub async fn base_snapshot_exists() -> Result<bool> {
+    Ok(base_snapshot_path().await?.is_some())
+}
+
+/// Artifact path of the newest installed snapshot named `BASE_SNAPSHOT`.
+async fn base_snapshot_path() -> Result<Option<PathBuf>> {
     let snapshots = Snapshot::list().await?;
-    Ok(snapshots.iter().any(|s| s.name() == Some(BASE_SNAPSHOT)))
+    Ok(snapshots
+        .iter()
+        .filter(|s| s.name() == Some(BASE_SNAPSHOT))
+        .max_by_key(|s| s.created_at())
+        .and_then(|s| s.path().ok())
+        .map(|path| path.to_path_buf()))
+}
+
+/// Remove every installed `BASE_SNAPSHOT` ahead of a rebuild. Grouped snapshots
+/// are immutable since microsandbox 0.7.8 — capturing with `force` is rejected —
+/// so replacing the base means removing the old one first.
+async fn remove_base_snapshots() -> Result<()> {
+    for snapshot in Snapshot::list().await? {
+        if snapshot.name() == Some(BASE_SNAPSHOT) {
+            snapshot
+                .remove(false)
+                .await
+                .with_context(|| format!("removing the previous '{BASE_SNAPSHOT}' snapshot"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Provision the libkrun runtime (`msb` + `libkrunfw`) the SDK needs to boot
@@ -113,9 +150,12 @@ pub async fn setup(force: bool, disk_gib: u32) -> Result<()> {
     sb.stop().await?;
     wait_until_stopped(BUILDER).await?;
 
+    // Only now that a fresh base is ready to capture: a failed build keeps the
+    // previous snapshot usable.
+    remove_base_snapshots().await?;
     Snapshot::builder(BASE_SNAPSHOT)
+        .group(SNAPSHOT_GROUP)
         .from_sandbox(BUILDER)
-        .force()
         .create()
         .await?;
 

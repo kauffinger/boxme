@@ -8,6 +8,7 @@ use ratatui::Frame;
 
 use crate::netcap::NetworkContact;
 use crate::outside::{SysFile, SysKind};
+use crate::packages::{self, ChangeKind, PackageChange};
 
 /// Cap on how many lines the expanded command view (toggled with `c`) takes, so
 /// a pathological command can't swallow the whole header.
@@ -30,6 +31,8 @@ pub struct FileItem {
     pub label: String,
     pub kind: FileKind,
     pub diff: Option<String>,
+    /// For a lockfile: the package versions it changed, shown above its diff.
+    pub packages: Vec<PackageChange>,
 }
 
 impl FileItem {
@@ -144,7 +147,14 @@ pub fn run(review: Review) -> Result<Outcome> {
         confirming: false,
     };
     if !app.review.files.is_empty() {
-        app.file_state.select(Some(0));
+        // Open on what an update changed, when there's a lockfile summary.
+        let first = app
+            .review
+            .files
+            .iter()
+            .position(|item| !item.packages.is_empty())
+            .unwrap_or(0);
+        app.file_state.select(Some(first));
     }
     if !app.review.network.is_empty() {
         app.net_state.select(Some(0));
@@ -517,7 +527,12 @@ fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
                 FileKind::Deleted => "- ",
                 FileKind::Binary => "* ",
             };
-            ListItem::new(format!("{prefix}{}", item.label)).style(file_style(item.kind))
+            let label = match item.packages.len() {
+                0 => item.label.clone(),
+                1 => format!("{} (1 package)", item.label),
+                n => format!("{} ({n} packages)", item.label),
+            };
+            ListItem::new(format!("{prefix}{label}")).style(file_style(item.kind))
         })
         .collect();
 
@@ -531,6 +546,18 @@ fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
         .selected()
         .and_then(|i| app.review.files.get(i));
     let diff_text = match selected {
+        Some(item) if !item.packages.is_empty() => {
+            let mut lines = package_lines(&item.packages);
+            if let Some(diff) = &item.diff {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "── lockfile diff ──",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.extend(colorize_diff(diff));
+            }
+            lines
+        }
         Some(item) => match &item.diff {
             Some(diff) => colorize_diff(diff),
             None => vec![Line::from(Span::styled(
@@ -568,6 +595,56 @@ fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((app.diff_scroll, 0));
     f.render_widget(diff, halves[1]);
+}
+
+/// The package summary shown for a lockfile: a count by kind, then one aligned
+/// row per package, coloured by how big a step it is.
+fn package_lines(changes: &[PackageChange]) -> Vec<Line<'static>> {
+    let manager = changes.first().map_or("", |c| c.manager);
+    let name_width = changes
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(0)
+        .min(48);
+    let from_width = changes
+        .iter()
+        .map(|c| c.from.as_deref().map_or(0, str::len))
+        .max()
+        .unwrap_or(0)
+        .min(24);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            packages::summary(manager, changes),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for change in changes {
+        let style = match change.change {
+            ChangeKind::Major | ChangeKind::Downgrade | ChangeKind::Removed => {
+                Style::default().fg(Color::Red)
+            }
+            ChangeKind::Minor | ChangeKind::Changed => Style::default().fg(Color::Yellow),
+            ChangeKind::Patch | ChangeKind::Added => Style::default().fg(Color::Green),
+        };
+        let from = change.from.as_deref().unwrap_or("");
+        let to = change.to.as_deref().unwrap_or("");
+        let arrow = match change.change {
+            ChangeKind::Added => "+",
+            ChangeKind::Removed => "-",
+            _ => "→",
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!(
+                "{:<name_width$}  {from:>from_width$} {arrow} {to:<12} ",
+                change.name
+            )),
+            Span::styled(change.change.label(), style),
+        ]));
+    }
+    lines
 }
 
 fn colorize_diff(diff: &str) -> Vec<Line<'_>> {

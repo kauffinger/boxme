@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use clap::CommandFactory;
 use microsandbox::{NetworkPolicy, Sandbox, Volume};
 use microsandbox_network::policy::{
     Action, Destination, DestinationGroup, Direction, DomainName, PortRange, Protocol, Rule,
@@ -11,14 +12,16 @@ use microsandbox_network::policy::{
 use microsandbox_network::secrets::config::SecretEntry;
 use owo_colors::OwoColorize;
 
-use crate::allowlist::{self, Scope};
+use crate::allowlist;
 use crate::cli::Cli;
 use crate::composer_auth;
 use crate::copyback::{self, CopyPlan};
 use crate::detect;
+use crate::dns;
 use crate::manifest::{self, Change, WriteSet};
 use crate::netcap::{self, NetworkContact};
 use crate::outside::{self, OutsideScan};
+use crate::packages::{self, PackageChange};
 use crate::report;
 use crate::review::{self, Decision, FileItem, FileKind, NetRow, NetStatus, Review};
 use crate::scripts;
@@ -27,6 +30,12 @@ use crate::util::{project_slug, shell_capture, shell_quote, stream_shell_stderr}
 
 /// Fetching a unified diff per unexpected file is one guest exec each — cap it.
 const MAX_DIFFS: usize = 100;
+
+/// Exit code of an interactive run the user aborted in the review: nothing
+/// landed, so a `boxme … && next-step` pipeline must not continue. Shares the
+/// boxme-error code; a run that was approved exits with the guest command's
+/// own code instead, like the bare command would.
+const EXIT_ABORTED: i32 = 1;
 
 /// Everything one in-guest command run produces that the review and copy-back
 /// need. Built by `run_command`.
@@ -43,18 +52,50 @@ struct CommandRun {
     /// File counts per expected write-set dir (vendor/, node_modules/), for the
     /// JSON report — the TUI renders them from `files` summary rows instead.
     dir_counts: Vec<(String, u64)>,
+    /// Package versions the changed lockfiles moved, across every manager.
+    packages: Vec<PackageChange>,
+    /// Whether the command wrote into an expected dir (vendor/, node_modules/),
+    /// which `changes` doesn't cover.
+    wrote_expected_dirs: bool,
 }
 
-/// What an enforced review resolves to: either we're finished (copied back or
-/// aborted), or the user allowed blocked host(s) and wants a clean re-run under
-/// the merged allowlist.
+impl CommandRun {
+    /// A failed command that left nothing to apply or look into: no file
+    /// changed inside the project or outside it, the scans are complete, and
+    /// every contact is one `allow` lets through. Its review would be empty.
+    fn failed_without_changes(&self, allow: &[String]) -> bool {
+        self.exit_code != 0
+            && self.changes.is_empty()
+            && !self.wrote_expected_dirs
+            && self.outside.available
+            && self.outside.files.is_empty()
+            && self.network_banner.is_none()
+            && blocked_hosts(&self.network, allow).is_empty()
+    }
+}
+
+/// What an enforced review resolves to.
 enum AfterReview {
-    /// Review finished. `Some` carries an approved changeset to apply to the
-    /// project *after* the VM is torn down — the project is the live overlay
-    /// lower during the run, so it must not be mutated until the mount is gone.
-    /// `None` means abort or nothing to copy back.
-    Done(Option<copyback::Staged>),
+    /// Approved: a changeset to apply to the project *after* the VM is torn
+    /// down — the project is the live overlay lower during the run, so it must
+    /// not be mutated until the mount is gone.
+    Approved(copyback::Staged),
+    /// The user quit the review; nothing lands.
+    Aborted,
+    /// The user allowed blocked host(s) and wants a clean re-run under the
+    /// merged allowlist.
     Rerun(Vec<String>),
+    /// The command failed without changing anything, so no review was shown.
+    FailedWithoutChanges,
+}
+
+/// What a learn run's review resolves to.
+enum Learned {
+    /// Approved under this saved allowlist.
+    Approved(Vec<String>),
+    Aborted,
+    /// The command failed without changing anything, so no review was shown.
+    FailedWithoutChanges,
 }
 
 /// The per-run inputs every stage shares: which command, where, the detected
@@ -63,8 +104,8 @@ enum AfterReview {
 struct RunCtx<'a> {
     cli: &'a Cli,
     project_dir: &'a Path,
-    /// The `++`-separated command chain; each entry is one composer/npm
-    /// invocation, run in order in the same guest as one changeset.
+    /// The `++`-separated command chain; each entry is one composer, npm or
+    /// php invocation, run in order in the same guest as one changeset.
     commands: &'a [Vec<String>],
     write_set: &'a WriteSet,
     php: &'a str,
@@ -79,8 +120,26 @@ struct RunCtx<'a> {
 pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     // 1. Validate + detect.
     let commands = split_commands(args)?;
+    for (tool, flag) in misplaced_flags(&commands) {
+        eprintln!(
+            "{}",
+            format!(
+                "warning: `{flag}` comes after `{tool}`, so {tool} gets it, not boxme — \
+                 boxme's own flags go first: `boxme {flag} {tool} …`"
+            )
+            .yellow()
+        );
+    }
     if let Some(conflict) = conflicting_flags(cli) {
         bail!("{conflict}");
+    }
+    if let Some(php) = &cli.php {
+        if !scripts::PHP_VERSIONS.contains(&php.as_str()) {
+            bail!(
+                "--php {php} isn't in the base image — pick one of {}",
+                scripts::PHP_VERSIONS.join(", ")
+            );
+        }
     }
     // The review TUI and the attached command both need a terminal — without
     // one, point at the non-interactive flow instead of hanging or garbling.
@@ -99,11 +158,15 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     }
 
     let project_dir = std::env::current_dir()?;
-    let php = detect::php_version(&project_dir).await;
+    let php = match &cli.php {
+        Some(php) => php.clone(),
+        None => detect::php_version(&project_dir).await,
+    };
     let node = detect::node_major(&project_dir).await;
     eprintln!(
-        "{} php {php}, node {}",
+        "{} php {php}{}, node {}",
         ">> detected:".dimmed(),
+        if cli.php.is_some() { " (--php)" } else { "" },
         node.map(|n| n.to_string())
             .unwrap_or_else(|| format!("{} (default)", scripts::BASE_NODE_MAJOR)),
     );
@@ -137,7 +200,7 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
         let allow = if cli.strict {
             Vec::new()
         } else {
-            allowlist::load(&project_dir, Scope::Packages)
+            allowlist::load(&project_dir)
         };
         return json_run(&ctx, allow).await;
     }
@@ -145,24 +208,23 @@ pub async fn run(cli: &Cli, args: &[String]) -> Result<i32> {
     // A run learns (observe + pick) when asked to, or the first time a project
     // has no allowlist yet. Otherwise it enforces straight away: `--strict` is
     // registries-only, an existing allowlist is registries + its entries.
-    if cli.learn || (!cli.strict && !allowlist::exists(&project_dir, Scope::Packages)) {
-        learn_run(&ctx).await?;
+    if cli.learn || (!cli.strict && !allowlist::exists(&project_dir)) {
+        learn_run(&ctx).await
     } else {
         // --strict ignores the allowlist (registries only) and disables the
         // allow-and-re-run affordance, since allowlisting wouldn't change it.
         let (allow, can_trust) = if cli.strict {
             (Vec::new(), false)
         } else {
-            (allowlist::load(&project_dir, Scope::Packages), true)
+            (allowlist::load(&project_dir), true)
         };
-        enforced_run(&ctx, allow, can_trust).await?;
+        enforced_run(&ctx, allow, can_trust).await
     }
-    Ok(0)
 }
 
 /// Flag combinations that contradict each other, rejected up front — before
-/// anything boots. Used by the package path and `boxme claude` alike.
-pub(crate) fn conflicting_flags(cli: &Cli) -> Option<&'static str> {
+/// anything boots.
+fn conflicting_flags(cli: &Cli) -> Option<&'static str> {
     if cli.strict && cli.learn {
         return Some(
             "--strict contradicts --learn: learning runs the command with the network \
@@ -182,7 +244,8 @@ pub(crate) fn conflicting_flags(cli: &Cli) -> Option<&'static str> {
 /// which must start with a supported tool. The chain runs sequentially in one
 /// guest and produces one combined changeset —
 /// `boxme composer install ++ composer run-script post-update-cmd` lets the
-/// script hook see `vendor/` without an apply in between.
+/// script hook see `vendor/` without an apply in between, and
+/// `boxme composer install ++ php artisan test` tests what was installed.
 fn split_commands(args: &[String]) -> Result<Vec<Vec<String>>> {
     let mut commands: Vec<Vec<String>> = vec![Vec::new()];
     for arg in args {
@@ -197,12 +260,37 @@ fn split_commands(args: &[String]) -> Result<Vec<Vec<String>>> {
     }
     for cmd in &commands {
         match cmd.first().map(String::as_str) {
-            Some("composer") | Some("npm") => {}
-            Some(tool) => bail!("boxme only wraps `composer` and `npm` (got `{tool}`)"),
+            Some("composer") | Some("npm") | Some("php") => {}
+            Some(tool) => bail!("boxme only wraps `composer`, `npm` and `php` (got `{tool}`)"),
             None => bail!("empty command in a `++` chain"),
         }
     }
     Ok(commands)
+}
+
+/// boxme's own flags written after a package-manager command, each with that
+/// command's tool. Everything after `composer`/`npm` goes to the tool
+/// untouched, so `boxme npm install --strict` quietly runs without boxme's
+/// strict policy. Only long flags count: `-a` is also composer's
+/// `--classmap-authoritative`.
+fn misplaced_flags(commands: &[Vec<String>]) -> Vec<(&str, &str)> {
+    let ours: Vec<String> = Cli::command()
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .filter_map(|arg| arg.get_long())
+        .map(|long| format!("--{long}"))
+        .collect();
+    let mut misplaced = Vec::new();
+    for command in commands {
+        for arg in &command[1..] {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            let found = (command[0].as_str(), arg.as_str());
+            if ours.iter().any(|own| own == flag) && !misplaced.contains(&found) {
+                misplaced.push(found);
+            }
+        }
+    }
+    misplaced
 }
 
 /// Whether any command in the chain runs `tool`. Valid only after
@@ -230,18 +318,8 @@ async fn json_run(ctx: &RunCtx<'_>, allow: Vec<String>) -> Result<i32> {
         Ok::<_, anyhow::Error>((run, staged))
     }
     .await;
-    let (run, staged) = match outcome {
-        Ok(v) => {
-            cleanup(ctx.cli, sb, &name).await;
-            v
-        }
-        Err(e) => {
-            // Honor --keep here too: a failed run is exactly when a kept VM is
-            // useful for poking around.
-            cleanup(ctx.cli, sb, &name).await;
-            return Err(e);
-        }
-    };
+    remove_vm(sb, &name).await;
+    let (run, staged) = outcome?;
 
     // VM is gone — safe to write into the project tree now.
     let pending = match staged {
@@ -312,6 +390,7 @@ fn build_report(
             })
             .collect(),
         files,
+        packages: run.packages.clone(),
         network: report::Network {
             banner: run.network_banner.clone(),
             contacts,
@@ -356,20 +435,21 @@ pub(crate) fn allow_hosts(hosts: &[String]) -> Result<()> {
         }
     }
     let project_dir = std::env::current_dir()?;
-    let merged = allowlist::save_merged(&project_dir, Scope::Packages, hosts)?;
+    let merged = allowlist::save_merged(&project_dir, hosts)?;
     eprintln!(
         "{} {} host(s) → {}",
         ">> allowlist:".dimmed(),
         merged.len(),
-        allowlist::path(&project_dir, Scope::Packages).display(),
+        allowlist::path(&project_dir).display(),
     );
     Ok(())
 }
 
 /// Observe the command with the network open, let the user trust hosts in the
 /// review, save them, then either copy back directly (if nothing it touched
-/// would be blocked) or re-run under enforcement for a clean result.
-async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
+/// would be blocked) or re-run under enforcement for a clean result. Returns
+/// the exit code for the process: the guest command's own, or `EXIT_ABORTED`.
+async fn learn_run(ctx: &RunCtx<'_>) -> Result<i32> {
     eprintln!(
         "{}",
         ">> learn: observing this run to build the allowlist".dimmed()
@@ -377,10 +457,12 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
     let (sb, name) = boot(ctx, observe_policy(), vm_name(ctx.project_dir)).await?;
 
     // Everything that can fail before the teardown decision runs here, so the
-    // observe VM is discarded in exactly one place on the error path. `None`
-    // means the user aborted the review.
-    let staged = async {
+    // observe VM is discarded in exactly one place on the error path.
+    let learned = async {
         let mut run = run_command(&sb, ctx).await?;
+        if run.failed_without_changes(&allowlist::load(ctx.project_dir)) {
+            return Ok((run, Learned::FailedWithoutChanges));
+        }
         let outcome = review::run(Review {
             files: std::mem::take(&mut run.files),
             network: net_rows(&run.network, learn_status),
@@ -394,27 +476,32 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
             command: run.command.clone(),
         })?;
         if outcome.decision == Decision::Abort {
-            return Ok(None);
+            return Ok((run, Learned::Aborted));
         }
         // Persist the picks; this creates the file even with no extra hosts, so
         // future runs in this project enforce by default.
-        let merged = allowlist::save_merged(ctx.project_dir, Scope::Packages, &outcome.allow)?;
-        Ok::<_, anyhow::Error>(Some((run, merged)))
+        let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
+        Ok::<_, anyhow::Error>((run, Learned::Approved(merged)))
     }
     .await;
 
-    let (run, merged) = match staged {
-        Ok(Some(staged)) => staged,
-        Ok(None) => {
-            discard(sb, &name).await;
+    let (run, merged) = match learned {
+        Ok((run, Learned::Approved(merged))) => (run, merged),
+        Ok((_, Learned::Aborted)) => {
+            remove_vm(sb, &name).await;
             eprintln!(
                 "{}",
                 "aborted — no allowlist written, nothing copied back".red()
             );
-            return Ok(());
+            return Ok(EXIT_ABORTED);
+        }
+        Ok((run, Learned::FailedWithoutChanges)) => {
+            remove_vm(sb, &name).await;
+            report_failure_without_changes(run.exit_code);
+            return Ok(run.exit_code);
         }
         Err(e) => {
-            discard(sb, &name).await;
+            remove_vm(sb, &name).await;
             return Err(e);
         }
     };
@@ -423,7 +510,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         "{} {} extra host(s) → {}",
         ">> learn: allowlist saved,".dimmed(),
         merged.len(),
-        allowlist::path(ctx.project_dir, Scope::Packages).display(),
+        allowlist::path(ctx.project_dir).display(),
     );
 
     // If everything the command contacted is allowed under enforcement, the
@@ -433,10 +520,11 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         // Stage while the VM is alive, then tear it down before mutating the
         // host project (it's the live overlay lower until the VM is gone).
         let staged = stage_copy_back(&sb, ctx.project_dir, ctx.write_set, &run).await;
-        cleanup(ctx.cli, sb, &name).await;
-        copyback::commit(ctx.project_dir, staged?)?;
+        remove_vm(sb, &name).await;
+        copyback::commit(ctx.project_dir, staged?, &copyback::Selection::everything())?;
         eprintln!("{}", "approved — results copied into the project".green());
-        return Ok(());
+        print_package_summary(&run.packages);
+        return Ok(run.exit_code);
     }
 
     eprintln!(
@@ -444,7 +532,7 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
         ">> re-running clean; these contacted host(s) will be blocked:".dimmed(),
         blocked.join(", ").dimmed(),
     );
-    discard(sb, &name).await;
+    remove_vm(sb, &name).await;
     enforced_run(ctx, merged, !ctx.cli.strict).await
 }
 
@@ -452,32 +540,36 @@ async fn learn_run(ctx: &RunCtx<'_>) -> Result<()> {
 /// back on approval or — if the user allowed blocked hosts — re-run clean under
 /// the updated allowlist. `can_trust` is false under `--strict`, where the
 /// allowlist is ignored and allowing a host wouldn't change the next run.
-async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> Result<()> {
+/// Returns the exit code for the process: the guest command's own on approval
+/// (a failed command's partial result can still be applied, but the failure
+/// must not read as success), or `EXIT_ABORTED`.
+async fn enforced_run(ctx: &RunCtx<'_>, allow: Vec<String>, can_trust: bool) -> Result<i32> {
     let (sb, name) = boot(ctx, enforced_policy(&allow), vm_name(ctx.project_dir)).await?;
     let outcome = async {
         let run = run_command(&sb, ctx).await?;
-        finish_review(&sb, ctx, run, &allow, can_trust).await
+        let exit_code = run.exit_code;
+        let changed_packages = run.packages.clone();
+        let after = finish_review(&sb, ctx, run, &allow, can_trust).await?;
+        Ok::<_, anyhow::Error>((after, exit_code, changed_packages))
     }
     .await;
-
-    // A re-run discards this VM unconditionally — like the observe VM, its result
-    // is thrown away; otherwise tear down honoring --keep.
-    match &outcome {
-        Ok(AfterReview::Rerun(_)) => discard(sb, &name).await,
-        _ => cleanup(ctx.cli, sb, &name).await,
-    }
+    remove_vm(sb, &name).await;
 
     match outcome? {
-        AfterReview::Done(staged) => {
+        (AfterReview::Approved(staged), exit_code, changed_packages) => {
             // VM is down now, so the project is no longer a live overlay lower —
             // safe to mutate the host tree.
-            if let Some(staged) = staged {
-                copyback::commit(ctx.project_dir, staged)?;
-                eprintln!("{}", "approved — results copied into the project".green());
-            }
-            Ok(())
+            copyback::commit(ctx.project_dir, staged, &copyback::Selection::everything())?;
+            eprintln!("{}", "approved — results copied into the project".green());
+            print_package_summary(&changed_packages);
+            Ok(exit_code)
         }
-        AfterReview::Rerun(merged) => {
+        (AfterReview::Aborted, ..) => Ok(EXIT_ABORTED),
+        (AfterReview::FailedWithoutChanges, exit_code, _) => {
+            report_failure_without_changes(exit_code);
+            Ok(exit_code)
+        }
+        (AfterReview::Rerun(merged), ..) => {
             eprintln!(
                 "{}",
                 ">> re-running clean under the updated allowlist".dimmed()
@@ -507,7 +599,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     }
 
     // Match host versions.
-    if uses_tool(commands, "composer") {
+    if uses_tool(commands, "composer") || uses_tool(commands, "php") {
         let code = stream_shell_stderr(sb, &scripts::php_switch(php)).await?;
         if code != 0 {
             bail!("switching the guest to PHP {php} failed");
@@ -592,6 +684,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
     // Manifest after + diff, partitioned expected vs unexpected.
     let after = manifest::parse(&shell_capture(sb, scripts::MANIFEST).await?);
     let changes = manifest::diff(&before, &after);
+    let packages = package_changes(sb, ctx.project_dir, &changes).await;
 
     // Sweep for anything the command wrote outside /workspace.
     let outside = match shell_capture(sb, &scripts::outside_scan(!ctx.secrets.is_empty())).await {
@@ -613,9 +706,15 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
                 label: format!("{dir}/: {count} files"),
                 kind: FileKind::ExpectedSummary,
                 diff: None,
+                packages: Vec::new(),
             });
         }
     }
+
+    let wrote_expected_dirs = !write_set.dirs.is_empty()
+        && shell_capture(sb, &scripts::written_dirs(&write_set.dirs))
+            .await
+            .map_or(true, |out| !out.trim().is_empty());
 
     let mut expected_files: Vec<String> = Vec::new();
     let mut unexpected: Vec<(String, Change)> = Vec::new();
@@ -626,6 +725,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
                 label: path.clone(),
                 kind: FileKind::ExpectedFile,
                 diff: fetch_diff(sb, path, change).await,
+                packages: lockfile_packages(&packages, path),
             });
         } else {
             unexpected.push((path.clone(), *change));
@@ -654,6 +754,7 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
             label: path.clone(),
             kind,
             diff,
+            packages: lockfile_packages(&packages, path),
         });
     }
 
@@ -668,12 +769,85 @@ async fn run_command(sb: &Sandbox, ctx: &RunCtx<'_>) -> Result<CommandRun> {
         expected_files,
         unexpected,
         dir_counts,
+        packages,
+        wrote_expected_dirs,
     })
+}
+
+/// The package changes behind every lockfile the run touched: the host copy is
+/// the before (the project is the read-only lower, untouched by the run), the
+/// guest's `/workspace` copy the after. A lockfile either side can't parse
+/// contributes nothing rather than a misleading list.
+async fn package_changes(
+    sb: &Sandbox,
+    project_dir: &Path,
+    changes: &[(String, Change)],
+) -> Vec<PackageChange> {
+    let mut all = Vec::new();
+    for (lockfile, manager) in packages::LOCKFILES {
+        if !changes.iter().any(|(path, _)| path == lockfile) {
+            continue;
+        }
+        let before = std::fs::read_to_string(project_dir.join(lockfile)).unwrap_or_default();
+        let after = shell_capture(
+            sb,
+            &format!("cat /workspace/{lockfile} 2>/dev/null || true"),
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(changed) = packages::diff_lockfiles(manager, &before, &after) {
+            all.extend(changed);
+        }
+    }
+    all
+}
+
+/// The changes to show next to `path` in the review, if it is a lockfile.
+fn lockfile_packages(changes: &[PackageChange], path: &str) -> Vec<PackageChange> {
+    let Some((_, manager)) = packages::LOCKFILES
+        .iter()
+        .find(|(lockfile, _)| *lockfile == path)
+    else {
+        return Vec::new();
+    };
+    changes
+        .iter()
+        .filter(|c| c.manager == *manager)
+        .cloned()
+        .collect()
+}
+
+/// Stands in for the review a failed, change-free run skips, so the command's
+/// own error stays on screen.
+fn report_failure_without_changes(exit_code: i32) {
+    eprintln!(
+        "{}",
+        format!(
+            "the command failed (exit {exit_code}) without changing anything — nothing to review"
+        )
+        .red()
+    );
+}
+
+/// One line per package manager after an approved run, so the terminal keeps a
+/// record of what the update did once the review is gone.
+fn print_package_summary(changes: &[PackageChange]) {
+    for (_, manager) in packages::LOCKFILES {
+        let changed: Vec<PackageChange> = changes
+            .iter()
+            .filter(|c| c.manager == *manager)
+            .cloned()
+            .collect();
+        if !changed.is_empty() {
+            eprintln!("   {}", packages::summary(manager, &changed));
+        }
+    }
 }
 
 /// Review of a finished enforced run. Copies back on approval, aborts on quit,
 /// or — when the user marked blocked hosts and confirmed — saves them to the
-/// allowlist and signals a clean re-run.
+/// allowlist and signals a clean re-run. A failed command that changed nothing
+/// skips the review.
 async fn finish_review(
     sb: &Sandbox,
     ctx: &RunCtx<'_>,
@@ -681,6 +855,9 @@ async fn finish_review(
     allow: &[String],
     can_trust: bool,
 ) -> Result<AfterReview> {
+    if run.failed_without_changes(allow) {
+        return Ok(AfterReview::FailedWithoutChanges);
+    }
     let outcome = review::run(Review {
         files: std::mem::take(&mut run.files),
         network: net_rows(&run.network, |c| enforced_status(c, allow, can_trust)),
@@ -697,21 +874,21 @@ async fn finish_review(
     match outcome.decision {
         Decision::Abort => {
             eprintln!("{}", "aborted — nothing copied back".red());
-            Ok(AfterReview::Done(None))
+            Ok(AfterReview::Aborted)
         }
         Decision::Approve => {
             // Pull the changeset out while the VM is alive; the caller applies it
             // to the host once the VM (and its read-only project bind) is gone.
             let staged = stage_copy_back(sb, ctx.project_dir, ctx.write_set, &run).await?;
-            Ok(AfterReview::Done(Some(staged)))
+            Ok(AfterReview::Approved(staged))
         }
         Decision::Rerun => {
-            let merged = allowlist::save_merged(ctx.project_dir, Scope::Packages, &outcome.allow)?;
+            let merged = allowlist::save_merged(ctx.project_dir, &outcome.allow)?;
             eprintln!(
                 "{} {} host(s) → {}",
                 ">> allowed".dimmed(),
                 outcome.allow.len(),
-                allowlist::path(ctx.project_dir, Scope::Packages).display(),
+                allowlist::path(ctx.project_dir).display(),
             );
             Ok(AfterReview::Rerun(merged))
         }
@@ -850,7 +1027,7 @@ async fn fetch_diff(sb: &Sandbox, path: &str, change: &Change) -> Option<String>
 }
 
 /// The user's command tokens, re-quoted for the guest shell.
-pub(crate) fn quote_args(args: &[String]) -> String {
+fn quote_args(args: &[String]) -> String {
     args.iter()
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
@@ -860,23 +1037,41 @@ pub(crate) fn quote_args(args: &[String]) -> String {
 /// A guest-shell `export` that makes a Linux-guest `npm install` resolve the
 /// *host's* platform-gated native deps, so the copied-back `node_modules` has
 /// the macOS prebuilt binaries (esbuild, rollup, lightningcss, swc, sharp, …)
-/// the host will load — empty if no chained command is npm, the host isn't
-/// macOS, or the user already pinned `npm_config_os` via `-e` (their value
-/// wins). Prints a note so the run is honest about retargeting the install.
+/// the host will load — empty if no chained command is npm or the host isn't
+/// macOS. Whichever of `npm_config_os` / `npm_config_cpu` the user pinned via
+/// `-e` is left alone (their value wins). Prints a note so the run is honest
+/// about retargeting the install.
 fn npm_platform_export(uses_npm: bool, env: &[(String, String)]) -> String {
-    if !uses_npm || env.iter().any(|(k, _)| k == "npm_config_os") {
+    if !uses_npm {
         return String::new();
     }
-    match host_npm_target() {
-        Some((os, cpu)) => {
-            eprintln!(
-                "{} resolving {os}/{cpu} native deps for the host",
-                ">> npm:".dimmed()
-            );
-            scripts::npm_platform_env(os, cpu)
-        }
-        None => String::new(),
+    let Some(target) = host_npm_target() else {
+        return String::new();
+    };
+    let (os, cpu) = npm_platform_overrides(target, env);
+    if os.is_none() && cpu.is_none() {
+        return String::new();
     }
+    eprintln!(
+        "{} resolving {}/{} native deps for the host",
+        ">> npm:".dimmed(),
+        os.unwrap_or("(pinned os)"),
+        cpu.unwrap_or("(pinned cpu)"),
+    );
+    scripts::npm_platform_env(os, cpu)
+}
+
+/// Which of the host target's `os`/`cpu` to export: each one only if the user
+/// hasn't already pinned the matching `npm_config_*` variable.
+fn npm_platform_overrides<'a>(
+    (os, cpu): (&'a str, &'a str),
+    env: &[(String, String)],
+) -> (Option<&'a str>, Option<&'a str>) {
+    let pinned = |key: &str| env.iter().any(|(k, _)| k == key);
+    (
+        (!pinned("npm_config_os")).then_some(os),
+        (!pinned("npm_config_cpu")).then_some(cpu),
+    )
 }
 
 /// The host's npm `os`/`cpu` target. `None` on non-macOS hosts — there the guest
@@ -897,7 +1092,7 @@ fn host_npm_target() -> Option<(&'static str, &'static str)> {
 /// `-e KEY=VALUE` is taken verbatim; bare `-e KEY` copies the host value and
 /// errors if the host doesn't have it (a silent skip would surface later as a
 /// confusing auth failure in the guest).
-pub(crate) fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
+fn resolve_env(specs: &[String]) -> Result<Vec<(String, String)>> {
     specs
         .iter()
         .map(|spec| {
@@ -946,6 +1141,7 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
     let project_dir =
         std::fs::canonicalize(ctx.project_dir).unwrap_or_else(|_| ctx.project_dir.to_path_buf());
     let mut builder = base_builder(name.as_str())
+        .await?
         .memory(ctx.cli.memory)
         .cpus(ctx.cli.cpus)
         .replace()
@@ -957,7 +1153,20 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
     for entry in &ctx.secrets {
         builder = builder.secret_entry(entry.clone());
     }
-    builder = builder.network(|n| n.policy(policy));
+    // microsandbox 0.7.8 turned on `strict` hostname policy by default, which
+    // denies a TLS connection allowed by a domain rule unless the TLS is
+    // intercepted — every HTTPS request to a registry dies after the
+    // ClientHello. boxme's enforcement is the SNI + DNS-binding check that
+    // non-strict mode keeps; intercepting every run instead would also mean
+    // pruning the CA store from the outside scan, hiding a rogue CA install.
+    let dns_relay = dns::relay().await;
+    builder = builder.network(|n| {
+        let n = n.policy(policy).strict(false);
+        match dns_relay {
+            Some(relay) => n.dns(|d| d.nameservers([relay])),
+            None => n,
+        }
+    });
     for (key, value) in &ctx.env {
         builder = builder.env(key, value);
     }
@@ -965,40 +1174,21 @@ async fn boot(ctx: &RunCtx<'_>, policy: NetworkPolicy, name: String) -> Result<(
     Ok((sb, name))
 }
 
-/// Tear down the run VM, honoring `--keep`.
-pub(crate) async fn cleanup(cli: &Cli, sb: Sandbox, name: &str) {
-    if cli.keep {
-        eprintln!(
-            "{} VM kept running as '{name}' — `boxme attach --vm {name}` opens a shell, \
-             `boxme kill {name}` removes it",
-            ">> --keep:".dimmed()
-        );
-        sb.detach().await;
-    } else {
-        remove_vm(sb, name, "VM").await;
-    }
-}
-
-/// Unconditionally remove a VM (ignores `--keep`) — used for the throwaway
-/// observe VM once a learn run decides to re-run under enforcement.
-async fn discard(sb: Sandbox, name: &str) {
-    remove_vm(sb, name, "observe VM").await;
-}
-
-/// Stop and remove a VM. `Sandbox::remove` operates by name, so the local
-/// handle is dropped first to release it before removal.
-async fn remove_vm(sb: Sandbox, name: &str, label: &str) {
+/// Stop and remove the run VM. Every run is throwaway: its result has either
+/// been staged out or discarded by the time this is called. `Sandbox::remove`
+/// operates by name, so the local handle is dropped first to release it.
+async fn remove_vm(sb: Sandbox, name: &str) {
     let _ = sb.stop().await;
     drop(sb);
     if let Err(e) = Sandbox::remove(name).await {
-        eprintln!("warning: could not remove {label} '{name}': {e}");
+        eprintln!("warning: could not remove VM '{name}': {e}");
     }
 }
 
 /// Named volumes must exist before a sandbox can mount them. Only the
 /// Node-version volume is mounted now (see `boot`); the composer/npm download
 /// caches stay guest-local to avoid the host's per-process file-descriptor cap.
-pub(crate) async fn ensure_cache_volumes() -> Result<()> {
+async fn ensure_cache_volumes() -> Result<()> {
     let existing = Volume::list().await?;
     let name = "boxme-node-versions";
     if !existing.iter().any(|v| v.name() == name) {
@@ -1007,7 +1197,7 @@ pub(crate) async fn ensure_cache_volumes() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn vm_name(project_dir: &Path) -> String {
+fn vm_name(project_dir: &Path) -> String {
     let slug = project_slug(project_dir);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1023,7 +1213,7 @@ pub(crate) fn vm_name(project_dir: &Path) -> String {
 /// SYN-based capture can't even see. Private/loopback/link-local/metadata stay
 /// denied by falling through to the default, as with microsandbox's own
 /// `public_only` default.
-pub(crate) fn observe_policy() -> NetworkPolicy {
+fn observe_policy() -> NetworkPolicy {
     NetworkPolicy {
         default_egress: Action::Deny,
         default_ingress: Action::Allow,
@@ -1041,7 +1231,7 @@ pub(crate) fn observe_policy() -> NetworkPolicy {
 }
 
 /// Deny-by-default egress: DNS plus the package registries over HTTP(S).
-pub(crate) fn strict_policy() -> NetworkPolicy {
+fn strict_policy() -> NetworkPolicy {
     let mut rules = vec![Rule::allow_dns()];
     for host in netcap::STRICT_DOMAINS {
         rules.push(entry_rule(host).expect("builtin strict domain parses"));
@@ -1055,28 +1245,8 @@ pub(crate) fn strict_policy() -> NetworkPolicy {
 
 /// Strict baseline plus the user's saved allowlist entries. Unparseable entries
 /// are skipped (they can only get there by hand-editing the file).
-pub(crate) fn enforced_policy(extra: &[String]) -> NetworkPolicy {
+fn enforced_policy(extra: &[String]) -> NetworkPolicy {
     let mut policy = strict_policy();
-    for entry in extra {
-        if let Some(rule) = entry_rule(entry) {
-            policy.rules.push(rule);
-        }
-    }
-    policy
-}
-
-/// Deny-by-default egress for `boxme claude`: the strict baseline (DNS + package
-/// registries — the agent legitimately runs composer/npm itself), the Anthropic
-/// API, and the user's `.boxme/claude-allow` extras. Unlike the package path
-/// there is no observe-by-default: claude always enforces, and `--learn` swaps in
-/// `observe_policy` to discover hosts instead.
-pub(crate) fn claude_policy(extra: &[String]) -> NetworkPolicy {
-    let mut policy = strict_policy();
-    for host in netcap::CLAUDE_DOMAINS {
-        policy
-            .rules
-            .push(entry_rule(host).expect("builtin claude domain parses"));
-    }
     for entry in extra {
         if let Some(rule) = entry_rule(entry) {
             policy.rules.push(rule);
@@ -1153,9 +1323,14 @@ mod tests {
             ]
         );
 
+        assert_eq!(
+            split_commands(&args(&["composer", "i", "++", "php", "artisan", "test"])).unwrap(),
+            vec![args(&["composer", "i"]), args(&["php", "artisan", "test"])]
+        );
+
         // Every segment must be a supported tool, and no segment may be empty.
-        assert!(split_commands(&args(&["php", "artisan"])).is_err());
-        assert!(split_commands(&args(&["composer", "i", "++", "php", "-v"])).is_err());
+        assert!(split_commands(&args(&["bash", "-c", "id"])).is_err());
+        assert!(split_commands(&args(&["composer", "i", "++", "sh", "-c", "id"])).is_err());
         assert!(split_commands(&args(&["composer", "i", "++"])).is_err());
         assert!(split_commands(&args(&["++", "composer", "i"])).is_err());
     }
@@ -1201,6 +1376,33 @@ mod tests {
     }
 
     #[test]
+    fn npm_platform_overrides_skip_whatever_the_user_pinned() {
+        let env = |keys: &[&str]| {
+            keys.iter()
+                .map(|k| (k.to_string(), "x".to_string()))
+                .collect::<Vec<_>>()
+        };
+        let target = ("darwin", "arm64");
+        assert_eq!(
+            npm_platform_overrides(target, &env(&[])),
+            (Some("darwin"), Some("arm64"))
+        );
+        assert_eq!(
+            npm_platform_overrides(target, &env(&["npm_config_os"])),
+            (None, Some("arm64"))
+        );
+        // A lone cpu pin must not be clobbered by boxme's own export.
+        assert_eq!(
+            npm_platform_overrides(target, &env(&["npm_config_cpu"])),
+            (Some("darwin"), None)
+        );
+        assert_eq!(
+            npm_platform_overrides(target, &env(&["npm_config_os", "npm_config_cpu"])),
+            (None, None)
+        );
+    }
+
+    #[test]
     fn resolve_env_rejects_multiline_values() {
         // A newline in a guest env value SIGABRTs the VMM before boot.
         let err = resolve_env(&["KEY=line one\nline two".to_string()]).unwrap_err();
@@ -1210,5 +1412,112 @@ mod tests {
         // Plain values still pass, including '=' inside the value.
         let ok = resolve_env(&["KEY=a=b".to_string()]).unwrap();
         assert_eq!(ok, vec![("KEY".to_string(), "a=b".to_string())]);
+    }
+
+    #[test]
+    fn boxme_flags_after_the_command_are_flagged() {
+        let commands = |tokens: &[&str]| {
+            split_commands(&tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+
+        assert_eq!(
+            misplaced_flags(&commands(&[
+                "npm",
+                "install",
+                "--strict",
+                "--memory=4096",
+                "--strict",
+                "++",
+                "composer",
+                "update",
+                "--json",
+            ])),
+            vec![
+                ("npm", "--strict"),
+                ("npm", "--memory=4096"),
+                ("composer", "--json")
+            ]
+        );
+        assert!(misplaced_flags(&commands(&[
+            "composer",
+            "install",
+            "-a",
+            "--no-dev",
+            "--help",
+            "--version",
+        ]))
+        .is_empty());
+    }
+
+    #[test]
+    fn only_a_failed_run_that_changed_nothing_skips_its_review() {
+        let contact = |domain: &str, known: bool| NetworkContact {
+            domain: Some(domain.to_string()),
+            ip: "203.0.113.7".to_string(),
+            port: 443,
+            known,
+        };
+        let failed = || CommandRun {
+            command: "boxme composer require nope/nope".to_string(),
+            exit_code: 2,
+            files: Vec::new(),
+            network: vec![contact("repo.packagist.org", true)],
+            network_banner: None,
+            outside: OutsideScan {
+                files: Vec::new(),
+                available: true,
+                truncated: false,
+            },
+            changes: Vec::new(),
+            expected_files: Vec::new(),
+            unexpected: Vec::new(),
+            dir_counts: Vec::new(),
+            packages: Vec::new(),
+            wrote_expected_dirs: false,
+        };
+        let allow = ["example.com".to_string()];
+
+        assert!(failed().failed_without_changes(&allow));
+        assert!(CommandRun {
+            network: vec![contact("api.example.com", false)],
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+
+        assert!(!CommandRun {
+            exit_code: 0,
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            changes: vec![("composer.json".to_string(), Change::Modified)],
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            wrote_expected_dirs: true,
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            network: vec![contact("evil.test", false)],
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            network_banner: Some("capture died".to_string()),
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            outside: OutsideScan::unavailable(),
+            ..failed()
+        }
+        .failed_without_changes(&allow));
+        assert!(!CommandRun {
+            outside: outside::parse("12\tf\t/usr/local/bin/backdoor\n"),
+            ..failed()
+        }
+        .failed_without_changes(&allow));
     }
 }
